@@ -1,7 +1,7 @@
 // Package tcshape enforces per-mark bandwidth limits with a Linux HTB
 // qdisc, classifying packets by the firewall mark that internal/conntrack
 // restores onto them. It only shapes egress (server -> client) traffic;
-// see the package README/report for why ingress shaping was left out.
+// see the README for why ingress shaping was left out.
 package tcshape
 
 import (
@@ -15,7 +15,7 @@ const (
 	// filter match. Kept low so it can't collide with a real mark's
 	// classIDFor encoding (see classIDFor).
 	defaultClassID = "1:1"
-	nftTable       = "ebpf_speedlimit"
+	nftTable       = "xray_speedlimit"
 
 	// minHTBBurstBytes floors the computed burst/cburst size so a very
 	// low class rate (or a short burstMs) can't round down to a value tc
@@ -45,7 +45,7 @@ type Shaper struct {
 }
 
 // New creates a Shaper for the given interface. defaultRateMbit sets the
-// rate of the default/unclassified-traffic HTB class; see the package
+// rate of the default/unclassified-traffic HTB class; see the
 // README for why it must reflect the interface's real link capacity.
 // burstMs sets every class's burst/cburst allowance to that many
 // milliseconds' worth of bytes at the class's own rate (0 leaves it at

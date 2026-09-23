@@ -1,21 +1,18 @@
 FROM golang:1.26-alpine AS builder
 
-RUN apk add --no-cache clang llvm musl-dev git
-
 WORKDIR /src
 
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN go generate ./... && \
-    CGO_ENABLED=0 go build -o /out/ebpf-speedlimit ./cmd/ebpf-speedlimit
+RUN CGO_ENABLED=0 go build -o /out/xray-speedlimit ./cmd/xray-speedlimit
 
 FROM alpine:3.24
 
 RUN apk add --no-cache ca-certificates iproute2 nftables ethtool
 
-COPY --from=builder /out/ebpf-speedlimit /usr/local/bin/ebpf-speedlimit
+COPY --from=builder /out/xray-speedlimit /usr/local/bin/xray-speedlimit
 
 EXPOSE 7070
-ENTRYPOINT ["/usr/local/bin/ebpf-speedlimit"]
+ENTRYPOINT ["/usr/local/bin/xray-speedlimit"]

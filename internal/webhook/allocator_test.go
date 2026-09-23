@@ -94,3 +94,42 @@ func TestAllocatorConcurrent(t *testing.T) {
 		}
 	}
 }
+
+func TestAllocatorMarks(t *testing.T) {
+	a := NewAllocator(1000, 10, nil)
+	markA, _ := a.Allocate("user-a")
+	markB, _ := a.Allocate("user-b")
+
+	got := a.Marks()
+	if len(got) != 2 || got["user-a"] != markA || got["user-b"] != markB {
+		t.Fatalf("unexpected marks: %v", got)
+	}
+
+	// The result is a copy: changing it must not affect the allocator.
+	got["user-a"] = 1
+	if again, _ := a.Allocate("user-a"); again != markA {
+		t.Fatalf("modifying the Marks result changed the allocator: got mark %d, want %d", again, markA)
+	}
+}
+
+func TestAllocatorMarksConcurrentWithAllocate(t *testing.T) {
+	a := NewAllocator(1, 500, nil)
+
+	var wg sync.WaitGroup
+	for i := range 500 {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			a.Allocate(string(rune(i)))
+		}()
+		go func() {
+			defer wg.Done()
+			_ = a.Marks()
+		}()
+	}
+	wg.Wait()
+
+	if got := len(a.Marks()); got != 500 {
+		t.Fatalf("expected 500 marks, got %d", got)
+	}
+}

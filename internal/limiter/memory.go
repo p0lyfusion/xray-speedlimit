@@ -2,9 +2,8 @@ package limiter
 
 import "sync"
 
-// memoryStore is a Store backed by a plain map, for running the
-// webhook/conntrack/tc backend standalone without the sock_ops program's
-// BPF map (and the cgroup v2 / CAP_BPF it requires).
+// memoryStore is a Store backed by a plain map. It is the base that
+// tcshape.WrapStore layers tc/HTB enforcement on top of.
 type memoryStore struct {
 	mu      sync.Mutex
 	entries map[uint32]uint32

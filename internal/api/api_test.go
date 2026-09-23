@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
@@ -44,6 +46,10 @@ func (m *memStore) List() ([]limiter.Entry, error) {
 	return out, nil
 }
 
+type fakeUsers map[string]uint32
+
+func (f fakeUsers) Marks() map[string]uint32 { return f }
+
 func doRequest(t *testing.T, s *Server, method, path string, body any) *httptest.ResponseRecorder {
 	t.Helper()
 	var buf bytes.Buffer
@@ -59,7 +65,7 @@ func doRequest(t *testing.T, s *Server, method, path string, body any) *httptest
 }
 
 func TestHealthz(t *testing.T) {
-	s := New(newMemStore(), nil)
+	s := New(newMemStore(), fakeUsers{}, nil)
 	rec := doRequest(t, s, http.MethodGet, "/healthz", nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rec.Code)
@@ -67,7 +73,7 @@ func TestHealthz(t *testing.T) {
 }
 
 func TestSetAndListAndDelete(t *testing.T) {
-	s := New(newMemStore(), nil)
+	s := New(newMemStore(), fakeUsers{}, nil)
 
 	rec := doRequest(t, s, http.MethodPut, "/marks/42", setRequest{RateBytesPerSec: 1_000_000})
 	if rec.Code != http.StatusOK {
@@ -102,7 +108,7 @@ func TestSetAndListAndDelete(t *testing.T) {
 }
 
 func TestSetInvalidMark(t *testing.T) {
-	s := New(newMemStore(), nil)
+	s := New(newMemStore(), fakeUsers{}, nil)
 
 	cases := []string{"-1", "abc", "4294967296", ""}
 	for _, mark := range cases {
@@ -118,7 +124,7 @@ func TestSetInvalidMark(t *testing.T) {
 }
 
 func TestSetInvalidRate(t *testing.T) {
-	s := New(newMemStore(), nil)
+	s := New(newMemStore(), fakeUsers{}, nil)
 
 	rec := doRequest(t, s, http.MethodPut, "/marks/1", setRequest{RateBytesPerSec: 0})
 	if rec.Code != http.StatusBadRequest {
@@ -132,10 +138,36 @@ func TestSetInvalidRate(t *testing.T) {
 }
 
 func TestSetUnknownField(t *testing.T) {
-	s := New(newMemStore(), nil)
+	s := New(newMemStore(), fakeUsers{}, nil)
 
 	rec := doRequest(t, s, http.MethodPut, "/marks/1", map[string]any{"rate_bytes_per_sec": 1, "burst": 1})
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for unknown field, got %d", rec.Code)
+	}
+}
+
+func TestUsers(t *testing.T) {
+	s := New(newMemStore(), fakeUsers{"b@example.com": 20001, "a@example.com": 20000}, nil)
+
+	rec := doRequest(t, s, http.MethodGet, "/users", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var users []userMark
+	if err := json.Unmarshal(rec.Body.Bytes(), &users); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	want := []userMark{{"a@example.com", 20000}, {"b@example.com", 20001}}
+	if !reflect.DeepEqual(users, want) {
+		t.Fatalf("got %+v, want %+v (sorted by mark)", users, want)
+	}
+}
+
+func TestUsersEmptyIsArray(t *testing.T) {
+	s := New(newMemStore(), fakeUsers{}, nil)
+
+	rec := doRequest(t, s, http.MethodGet, "/users", nil)
+	if got := strings.TrimSpace(rec.Body.String()); got != "[]" {
+		t.Fatalf("expected [] for no users, got %q", got)
 	}
 }
