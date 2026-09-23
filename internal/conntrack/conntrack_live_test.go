@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -166,7 +167,8 @@ func TestLiveSetMarkIgnoresBrokenDestinationIP(t *testing.T) {
 // the destination IP Xray reported is the broken wildcard sentinel, so
 // both flows match on source 4-tuple plus destination port alone. This is
 // exactly what a user can self-trigger on demand (bind an explicit local
-// port, then connect to two different local IPs on the same port) to try
+// port with SO_REUSEADDR, then connect to two different local IPs on the
+// same port) to try
 // to get one of their own connections riding unmarked; SetMark must mark
 // every matching flow, not pick one or skip, so both of that user's
 // connections stay correctly capped.
@@ -207,14 +209,27 @@ func TestLiveSetMarkMarksAllAmbiguousMatches(t *testing.T) {
 	// Same source IP:port dialing two different destination IPs on the
 	// same port is a legal, non-colliding pair of 4-tuples for the OS,
 	// which is exactly what makes this ambiguous once the destination IP
-	// is unknown.
-	const sharedSrcPort = 48291
-	dialer := net.Dialer{LocalAddr: &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: sharedSrcPort}}
+	// is unknown. Binding the second socket to a port the first one
+	// already holds needs SO_REUSEADDR on both; without it the second
+	// dial fails with EADDRINUSE. The first dial picks a free port, so
+	// the test can't collide with anything else on the host.
+	reuseAddr := func(_, _ string, c syscall.RawConn) error {
+		var sockErr error
+		if err := c.Control(func(fd uintptr) {
+			sockErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+		}); err != nil {
+			return err
+		}
+		return sockErr
+	}
+	dialer := net.Dialer{LocalAddr: &net.TCPAddr{IP: net.ParseIP("127.0.0.1")}, Control: reuseAddr}
 	client1, err := dialer.Dial("tcp4", ln1.Addr().String())
 	if err != nil {
 		t.Fatalf("dial 1: %v", err)
 	}
 	defer client1.Close()
+	sharedSrcPort := uint16(client1.LocalAddr().(*net.TCPAddr).Port)
+	dialer.LocalAddr = client1.LocalAddr()
 	client2, err := dialer.Dial("tcp4", ln2.Addr().String())
 	if err != nil {
 		t.Fatalf("dial 2: %v", err)

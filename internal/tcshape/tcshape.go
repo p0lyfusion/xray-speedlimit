@@ -11,9 +11,15 @@ import (
 )
 
 const (
+	// MinMark and MaxMark bound the marks a Shaper accepts. Mark 0 means
+	// "no mark", mark 1 would encode to defaultClassID (see classIDFor),
+	// and the HTB classid minor is a 16-bit field.
+	MinMark = 2
+	MaxMark = 0xffff
+
 	// defaultClassID is the catch-all bucket for traffic with no fw
-	// filter match. Kept low so it can't collide with a real mark's
-	// classIDFor encoding (see classIDFor).
+	// filter match. It is what classIDFor would return for mark 1, which
+	// is why MinMark is 2.
 	defaultClassID = "1:1"
 	nftTable       = "xray_speedlimit"
 
@@ -30,10 +36,26 @@ const (
 // handle (see SetRate) that is compared against the real (undecorated)
 // skb mark.
 func classIDFor(mark uint32) (string, error) {
-	if mark == 0 || mark > 0xffff {
-		return "", fmt.Errorf("mark %d is out of the 16-bit HTB classid range (1-65535)", mark)
+	if mark < MinMark || mark > MaxMark {
+		return "", fmt.Errorf("mark %d is out of the usable HTB classid range (%d-%d; 1:1 is the default class)", mark, MinMark, MaxMark)
 	}
 	return fmt.Sprintf("1:%x", mark), nil
+}
+
+// fwFilters lists the tc protocol and prio of each fw filter SetRate
+// installs per mark. IPv4 and IPv6 need a filter each, because a tc
+// filter only sees packets of its own protocol. They sit at different
+// prios because the kernel refuses to mix protocols within one prio, and
+// prio 1 already holds protocol ip filters on existing installs.
+var fwFilters = []struct{ protocol, prio string }{
+	{"ip", "1"},
+	{"ipv6", "2"},
+}
+
+// fwFilterArgs builds a "tc filter <verb>" command line for mark's fw
+// filter of the given protocol/prio.
+func (s *Shaper) fwFilterArgs(verb, protocol, prio string, mark uint32, classID string) []string {
+	return []string{"filter", verb, "dev", s.iface, "parent", "1:", "protocol", protocol, "prio", prio, "handle", fmt.Sprintf("%d", mark), "fw", "flowid", classID}
 }
 
 // Shaper manages an HTB qdisc and one class+filter pair per mark on a
@@ -95,21 +117,24 @@ func RootQdiscExists(iface string) (bool, error) {
 }
 
 // EnsureRoot creates the root HTB qdisc and its default class if they are
-// not already present. rootExists should come from a fresh
+// not already present, and (re)installs the conntrack mark restore rule
+// either way. rootExists should come from a fresh
 // RootQdiscExists(s.iface) call — callers that already needed that answer
 // for another reason (e.g. deciding whether to auto-detect a rate) pass
 // it straight through instead of this re-querying it.
+//
+// The nft rule is not tied to rootExists: the qdisc can outlive it (an
+// earlier start that failed at the nft step, or an nftables service
+// reload that flushed the ruleset), and without it nothing is shaped.
 func (s *Shaper) EnsureRoot(rootExists bool) error {
-	if rootExists {
-		return nil
-	}
-
-	if err := run("tc", "qdisc", "add", "dev", s.iface, "root", "handle", "1:", "htb", "default", "1"); err != nil {
-		return fmt.Errorf("creating root htb qdisc on %s: %w", s.iface, err)
-	}
-	defaultRateBps := s.defaultRateMbit * 1_000_000 / 8
-	if err := run("tc", s.classArgs("add", defaultClassID, defaultRateBps)...); err != nil {
-		return fmt.Errorf("creating default htb class on %s: %w", s.iface, err)
+	if !rootExists {
+		if err := run("tc", "qdisc", "add", "dev", s.iface, "root", "handle", "1:", "htb", "default", "1"); err != nil {
+			return fmt.Errorf("creating root htb qdisc on %s: %w", s.iface, err)
+		}
+		defaultRateBps := s.defaultRateMbit * 1_000_000 / 8
+		if err := run("tc", s.classArgs("add", defaultClassID, defaultRateBps)...); err != nil {
+			return fmt.Errorf("creating default htb class on %s: %w", s.iface, err)
+		}
 	}
 
 	if err := ensureConnmarkRestore(); err != nil {
@@ -118,28 +143,41 @@ func (s *Shaper) EnsureRoot(rootExists bool) error {
 	return nil
 }
 
+// connmarkRestoreRuleset recreates this package's nft table in a single
+// atomic transaction (the leading "table" + "delete table" pair is the
+// usual create-if-missing-then-drop idiom), so it is safe to apply on
+// every start and replaces any older version of the rule.
+//
+// "ct mark != 0" matters: an unconditional "meta mark set ct mark" would
+// zero the packet mark of every connection this service never marked,
+// wiping marks other tools rely on later in postrouting (e.g. Tailscale's
+// or kube-proxy's masquerade marks, which nat postrouting checks after
+// this mangle-priority chain has run).
+var connmarkRestoreRuleset = fmt.Sprintf(`table inet %[1]s
+delete table inet %[1]s
+table inet %[1]s {
+	chain postrouting {
+		type filter hook postrouting priority mangle; policy accept;
+		ct mark != 0 meta mark set ct mark
+	}
+}
+`, nftTable)
+
 // ensureConnmarkRestore installs an nftables rule that copies the
 // conntrack mark onto the packet mark on the way out, which is what lets
 // the "fw" tc filters classify by it. As a side effect, having any
 // conntrack-aware rule loaded is also what makes the kernel track
 // connections in this network namespace in the first place.
 func ensureConnmarkRestore() error {
-	out, err := exec.Command("nft", "list", "table", "inet", nftTable).CombinedOutput()
-	if err == nil && strings.Contains(string(out), "meta mark set ct mark") {
-		return nil
+	cmd := exec.Command("nft", "-f", "-")
+	cmd.Stdin = strings.NewReader(connmarkRestoreRuleset)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("nft -f -: %w: %s", err, strings.TrimSpace(string(out)))
 	}
-
-	if err := run("nft", "add", "table", "inet", nftTable); err != nil {
-		return err
-	}
-	if err := run("nft", "add", "chain", "inet", nftTable, "postrouting",
-		"{", "type", "filter", "hook", "postrouting", "priority", "mangle", ";", "}"); err != nil {
-		return err
-	}
-	return run("nft", "add", "rule", "inet", nftTable, "postrouting", "meta", "mark", "set", "ct", "mark")
+	return nil
 }
 
-// SetRate creates or updates the HTB class and fw filter for mark.
+// SetRate creates or updates the HTB class and fw filters for mark.
 func (s *Shaper) SetRate(mark uint32, rateBytesPerSec uint32) error {
 	classID, err := classIDFor(mark)
 	if err != nil {
@@ -149,21 +187,26 @@ func (s *Shaper) SetRate(mark uint32, rateBytesPerSec uint32) error {
 		return fmt.Errorf("setting htb rate for mark %d on %s: %w", mark, s.iface, err)
 	}
 
-	filterArgs := []string{"filter", "replace", "dev", s.iface, "parent", "1:", "protocol", "ip", "prio", "1", "handle", fmt.Sprintf("%d", mark), "fw", "flowid", classID}
-	if err := run("tc", filterArgs...); err != nil {
-		return fmt.Errorf("setting fw filter for mark %d on %s: %w", mark, s.iface, err)
+	for _, f := range fwFilters {
+		if err := run("tc", s.fwFilterArgs("replace", f.protocol, f.prio, mark, classID)...); err != nil {
+			return fmt.Errorf("setting %s fw filter for mark %d on %s: %w", f.protocol, mark, s.iface, err)
+		}
 	}
 	return nil
 }
 
-// Remove deletes the fw filter and HTB class for mark.
+// Remove deletes the fw filters and HTB class for mark. A mark outside
+// [MinMark, MaxMark] is a no-op: SetRate never creates anything for it,
+// and mark 1 would otherwise name the default class.
 func (s *Shaper) Remove(mark uint32) error {
 	classID, err := classIDFor(mark)
 	if err != nil {
-		return err
+		return nil
 	}
 
-	_ = run("tc", "filter", "del", "dev", s.iface, "parent", "1:", "protocol", "ip", "prio", "1", "handle", fmt.Sprintf("%d", mark), "fw", "flowid", classID)
+	for _, f := range fwFilters {
+		_ = run("tc", s.fwFilterArgs("del", f.protocol, f.prio, mark, classID)...)
+	}
 
 	out, err := exec.Command("tc", "class", "del", "dev", s.iface, "parent", "1:", "classid", classID).CombinedOutput()
 	if err != nil && !strings.Contains(string(out), "No such file or directory") {

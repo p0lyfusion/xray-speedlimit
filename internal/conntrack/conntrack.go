@@ -79,6 +79,11 @@ func (m *Marker) SetMark(proto string, srcIP net.IP, srcPort uint16, dstIP net.I
 
 	for _, flow := range matches {
 		flow.Mark = mark
+		// ConntrackUpdate sends back every field the dump filled in. The
+		// TCP state in the dump may already be stale (the connection can
+		// have moved on to FIN_WAIT or TIME_WAIT since), and writing it
+		// back would rewind the connection. Leave the state alone.
+		flow.ProtoInfo = nil
 		if err := netlink.ConntrackUpdate(netlink.ConntrackTable, family, flow); err != nil {
 			return fmt.Errorf("updating conntrack mark: %w", err)
 		}

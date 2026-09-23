@@ -2,6 +2,7 @@ package tcshape
 
 import (
 	"log/slog"
+	"sync"
 
 	"github.com/p0lyfusion/xray-speedlimit/internal/limiter"
 )
@@ -14,6 +15,11 @@ type RateShaper interface {
 }
 
 type shapedStore struct {
+	// mu makes each Set/Delete's tc change and base update one step.
+	// Without it, a concurrent Set and Delete of the same mark can
+	// interleave (Set's tc, Delete's tc, Delete's base, Set's base) and
+	// leave List showing a limit whose class no longer exists.
+	mu     sync.Mutex
 	base   limiter.Store
 	shaper RateShaper
 	log    *slog.Logger
@@ -33,6 +39,8 @@ func WrapStore(base limiter.Store, shaper RateShaper, log *slog.Logger) limiter.
 // succeeds, so a tc failure (e.g. a mark outside the 16-bit classid range)
 // never shows up in List as a limit that isn't actually enforced.
 func (s *shapedStore) Set(mark uint32, rate uint32) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := s.shaper.SetRate(mark, rate); err != nil {
 		s.log.Error("tc shaping: failed to apply rate", "mark", mark, "error", err)
 		return err
@@ -43,6 +51,8 @@ func (s *shapedStore) Set(mark uint32, rate uint32) error {
 // Delete removes the tc class first, for the same reason as Set: if that
 // fails, the mark is still limited and must stay in List.
 func (s *shapedStore) Delete(mark uint32) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := s.shaper.Remove(mark); err != nil {
 		s.log.Error("tc shaping: failed to remove class", "mark", mark, "error", err)
 		return err

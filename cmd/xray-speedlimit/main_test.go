@@ -109,8 +109,8 @@ func TestMarkRangeSet(t *testing.T) {
 	if err := r.Set("7-7"); err != nil || r.count() != 1 {
 		t.Fatalf("single-mark range: err=%v count=%d", err, r.count())
 	}
-	if err := r.Set("1-65535"); err != nil {
-		t.Fatalf("full 16-bit range should be accepted: %v", err)
+	if err := r.Set("2-65535"); err != nil {
+		t.Fatalf("full usable 16-bit range should be accepted: %v", err)
 	}
 }
 
@@ -122,6 +122,7 @@ func TestMarkRangeSetRejectsInvalid(t *testing.T) {
 		"-5",
 		"5-",
 		"0-10",        // mark 0 means "no mark"
+		"1-10",        // mark 1 would be the default class 1:1
 		"1-65536",     // past the 16-bit HTB classid limit
 		"70000-80000", // entirely past it
 		"10-5",        // reversed

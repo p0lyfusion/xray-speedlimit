@@ -50,8 +50,13 @@ type Handler struct {
 	perUserRateBytesPerSec uint32
 	log                    *slog.Logger
 
-	provisionedMu sync.Mutex
-	provisioned   map[uint32]bool
+	// provisioned records marks whose rate.Set has succeeded (mark ->
+	// struct{}). It is read without a lock on every webhook, so an
+	// already-provisioned user never waits behind another user's tc call.
+	provisioned sync.Map
+	// provisionMu serializes rate.Set calls, so two webhooks for a new
+	// mark can't provision it twice.
+	provisionMu sync.Mutex
 }
 
 // New creates a webhook Handler. If rate is non-nil, every newly
@@ -69,7 +74,6 @@ func New(alloc *Allocator, marker Marker, rate RateSetter, perUserRateBytesPerSe
 		rate:                   rate,
 		perUserRateBytesPerSec: perUserRateBytesPerSec,
 		log:                    log,
-		provisioned:            make(map[uint32]bool),
 	}
 }
 
@@ -81,15 +85,18 @@ func New(alloc *Allocator, marker Marker, rate RateSetter, perUserRateBytesPerSe
 // without a rate for the life of the process, since the allocator has
 // already cached the mark by the time the caller learns Set failed.
 func (h *Handler) tryProvision(mark uint32) error {
-	h.provisionedMu.Lock()
-	defer h.provisionedMu.Unlock()
-	if h.provisioned[mark] {
+	if _, ok := h.provisioned.Load(mark); ok {
+		return nil
+	}
+	h.provisionMu.Lock()
+	defer h.provisionMu.Unlock()
+	if _, ok := h.provisioned.Load(mark); ok {
 		return nil
 	}
 	if err := h.rate.Set(mark, h.perUserRateBytesPerSec); err != nil {
 		return err
 	}
-	h.provisioned[mark] = true
+	h.provisioned.Store(mark, struct{}{})
 	return nil
 }
 

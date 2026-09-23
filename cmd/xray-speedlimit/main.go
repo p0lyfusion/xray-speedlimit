@@ -24,6 +24,11 @@ import (
 	"github.com/p0lyfusion/xray-speedlimit/internal/webhook"
 )
 
+// readHeaderTimeout bounds how long either server waits for a request's
+// headers, so a client that connects and stalls can't hold a connection
+// (and a file descriptor) open indefinitely.
+const readHeaderTimeout = 10 * time.Second
+
 // config holds everything main's flags configure.
 type config struct {
 	addr                 string
@@ -41,7 +46,7 @@ func main() {
 	flag.StringVar(&cfg.addr, "addr", ":7070", "HTTP API listen address")
 	flag.StringVar(&cfg.webhookAddr, "webhook-addr", "@xray-speedlimit-webhook", "listen address for the Xray webhook receiver, separate from -addr since this is hit on every new connection: host:port, a filesystem Unix socket path, or a Linux abstract socket (@name, or @@name padded for HAProxy compatibility) — abstract is the default and fastest, and needs no bind mount across a --network host container boundary")
 	flag.StringVar(&cfg.iface, "iface", "", "network interface for tc/HTB shaping (default: the interface used by the default route)")
-	flag.Var(&cfg.marks, "mark-range", "inclusive range of marks handed out to users, as first-last; must lie within 1-65535 (the HTB classid limit)")
+	flag.Var(&cfg.marks, "mark-range", "inclusive range of marks handed out to users, as first-last; must lie within 2-65535 (the HTB classid limit, and 1:1 is the default class)")
 	flag.Uint64Var(&cfg.defaultClassRateMbit, "default-class-rate-mbit", 0, "rate (Mbit/s) for the tc/HTB default class, which catches all traffic with no per-user mark (system traffic, and every user's own outbound-to-destination leg); 0 = auto-detect via ethtool on -iface")
 	flag.Uint64Var(&cfg.htbBurstMs, "htb-burst-ms", 100, "burst/cburst allowance for every tc/HTB class (default and per-user), in milliseconds' worth of bytes at that class's own rate; 0 = kernel's own default sizing (normally just a couple KB)")
 	flag.Uint64Var(&cfg.perUserRateMbit, "per-user-rate-mbit", 0, "if set, automatically provisions this rate (Mbit/s) for every newly allocated mark, applying it uniformly to every user with zero manual provisioning; 0 = don't auto-provision, manage rates by hand via PUT /marks/{mark}")
@@ -75,22 +80,24 @@ func run(cfg config, log *slog.Logger) error {
 	var perUserRate webhook.RateSetter
 	var perUserRateBytesPerSec uint32
 	if cfg.perUserRateMbit > 0 {
-		bps := cfg.perUserRateMbit * 1_000_000 / 8
-		if bps > math.MaxUint32 {
-			return fmt.Errorf("per-user-rate-mbit %d converts to %d bytes/sec, which must be between 1 and 4294967295 (uint32 limit of the mark -> rate store)", cfg.perUserRateMbit, bps)
+		// Check before multiplying: a huge value would wrap around uint64
+		// and slip under the limit as a tiny rate.
+		const bytesPerSecPerMbit = 1_000_000 / 8
+		if cfg.perUserRateMbit > math.MaxUint32/bytesPerSecPerMbit {
+			return fmt.Errorf("per-user-rate-mbit %d is too large: it must convert to at most 4294967295 bytes/sec (uint32 limit of the mark -> rate store), i.e. at most %d", cfg.perUserRateMbit, math.MaxUint32/bytesPerSecPerMbit)
 		}
 		perUserRate = store
-		perUserRateBytesPerSec = uint32(bps)
+		perUserRateBytesPerSec = uint32(cfg.perUserRateMbit * bytesPerSecPerMbit)
 		log.Info("auto-provisioning per-user tc/HTB rate on allocation", "mbit", cfg.perUserRateMbit, "bytes_per_sec", perUserRateBytesPerSec)
 	}
 
 	alloc := webhook.NewAllocator(cfg.marks.first, cfg.marks.count(), log)
 
-	apiSrv := &http.Server{Handler: api.New(store, alloc, log)}
+	apiSrv := &http.Server{Handler: api.New(store, alloc, log), ReadHeaderTimeout: readHeaderTimeout}
 
 	webhookMux := http.NewServeMux()
 	webhookMux.Handle("/webhook/xray", webhook.New(alloc, conntrack.NewMarker(log), perUserRate, perUserRateBytesPerSec, log))
-	webhookSrv := &http.Server{Handler: webhookMux}
+	webhookSrv := &http.Server{Handler: webhookMux, ReadHeaderTimeout: readHeaderTimeout}
 
 	log.Info("shaping enabled", "iface", iface, "mark_range", cfg.marks.String())
 
@@ -165,7 +172,8 @@ func (r *markRange) String() string {
 
 // Set parses and validates a "first-last" range. Every mark must fit in
 // 16 bits because it doubles as an HTB classid minor number (see
-// tcshape.classIDFor), and mark 0 means "no mark" to the kernel.
+// tcshape.classIDFor), mark 0 means "no mark" to the kernel, and mark 1
+// would encode to the default class 1:1.
 func (r *markRange) Set(s string) error {
 	firstStr, lastStr, ok := strings.Cut(s, "-")
 	if !ok {
@@ -183,8 +191,10 @@ func (r *markRange) Set(s string) error {
 	switch {
 	case first == 0:
 		return errors.New("mark 0 means \"no mark\" and can't be handed out")
-	case last > 0xffff:
-		return errors.New("marks must not exceed 65535 (HTB classids are 16-bit)")
+	case first < tcshape.MinMark:
+		return fmt.Errorf("mark %d would be the tc/HTB default class 1:1; start the range at %d or above", first, tcshape.MinMark)
+	case last > tcshape.MaxMark:
+		return fmt.Errorf("marks must not exceed %d (HTB classids are 16-bit)", tcshape.MaxMark)
 	case first > last:
 		return fmt.Errorf("first mark %d is greater than last mark %d", first, last)
 	}

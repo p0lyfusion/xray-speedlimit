@@ -9,8 +9,8 @@ Xray-core only learns which user owns a connection after it has decrypted and pa
 1. Xray-core's stock routing `webhook` action POSTs an event to `/webhook/xray` for every routed connection. The event carries the user's `email` and the client-facing 4-tuple (`source`, `inboundLocal`).
 2. The service gives each `email` its own mark from `-mark-range`. The mark stays the same for as long as the process runs.
 3. It sets that mark on the client connection's conntrack entry over netlink (`ConntrackUpdate`).
-4. An nftables rule (`meta mark set ct mark`, in table `inet xray_speedlimit`) copies the conntrack mark onto each outgoing packet.
-5. A root HTB qdisc on `-iface` has one class plus one `fw` filter per mark, so each user's packets land in their own rate-limited class.
+4. An nftables rule (`ct mark != 0 meta mark set ct mark`, in table `inet xray_speedlimit`) copies the conntrack mark onto each outgoing packet of a marked connection. Packets of unmarked connections keep whatever mark they already had. The service re-applies this table on every start.
+5. A root HTB qdisc on `-iface` has one class plus two `fw` filters (IPv4 and IPv6) per mark, so each user's packets land in their own rate-limited class.
 
 ```
 Xray webhook POST ─→ allocator (email → mark) ─→ conntrack mark (netlink)
@@ -43,8 +43,8 @@ Without an explicit burst, HTB sizes a class's token bucket from its rate alone.
 
 `-mark-range` is inclusive on both ends, and startup checks it:
 
-- It must lie within `1-65535`, because each mark is also an HTB classid minor number, which is 16 bits.
-- Mark `0` means "no mark" and is never handed out.
+- It must lie within `2-65535`, because each mark is also an HTB classid minor number, which is 16 bits.
+- Mark `0` means "no mark" and is never handed out. Mark `1` would be classid `1:1`, the default class.
 - Keep the range disjoint from any other marks used on the host. Everything ends up in the same `skb->mark`.
 
 When the range is used up, the service logs one warning. Later new users go unmarked and ride the default class.
@@ -116,7 +116,7 @@ The image includes `iproute2` (`tc`), `nftables` and `ethtool`, which the servic
       network interface for tc/HTB shaping (default: the interface used by the default route)
 -mark-range value
       inclusive range of marks handed out to users, as first-last; must lie within
-      1-65535 (default 20000-39999)
+      2-65535 (default 20000-39999)
 -default-class-rate-mbit uint
       rate (Mbit/s) for the tc/HTB default class; 0 = auto-detect via ethtool on -iface
 -htb-burst-ms uint
@@ -138,7 +138,7 @@ curl -X PUT localhost:7070/marks/20000 \
   -d '{"rate_bytes_per_sec": 1000000}'
 ```
 
-Returns `{"mark":20000,"rate_bytes_per_sec":1000000}` on success. `mark` must fit in a `uint32`, and `rate_bytes_per_sec` must be between 1 and 4294967295. Setting a rate needs a mark in `1-65535`, because it creates an HTB class, so any other mark gets a 500.
+Returns `{"mark":20000,"rate_bytes_per_sec":1000000}` on success. `mark` must fit in a `uint32`, and `rate_bytes_per_sec` must be between 1 and 4294967295. Setting a rate needs a mark in `2-65535`, because it creates an HTB class (and `1:1` is the default class), so any other mark gets a 500.
 
 ### `DELETE /marks/{mark}`: remove a limit
 
