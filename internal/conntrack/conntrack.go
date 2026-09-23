@@ -38,7 +38,7 @@ func NewMarker(log *slog.Logger) *Marker {
 // port — the OS only requires the full 5-tuple to be unique, not the
 // source half alone). SetMark marks every matching flow rather than
 // picking one or skipping — see the Marker interface doc in
-// internal/webhook and the package README for why callers may hand in an
+// internal/webhook and the README for why callers may hand in an
 // unspecified dstIP at all, and why marking every match is the correct
 // (not merely safe) response to that ambiguity. A non-wildcard dstIP is
 // always required to match exactly, since it plus the rest of the tuple

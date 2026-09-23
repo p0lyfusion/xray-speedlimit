@@ -43,7 +43,7 @@ func TestListenTCP(t *testing.T) {
 }
 
 func TestListenAbstractUnixSocket(t *testing.T) {
-	l, err := listen("@ebpf-speedlimit-test")
+	l, err := listen("@xray-speedlimit-test")
 	if err != nil {
 		t.Skipf("abstract unix sockets unavailable in this environment: %v", err)
 	}
@@ -91,5 +91,46 @@ func TestListenRefusesToDeleteNonSocketFile(t *testing.T) {
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("non-socket file should survive a failed listen attempt: %v", err)
+	}
+}
+
+func TestMarkRangeSet(t *testing.T) {
+	var r markRange
+	if err := r.Set("20000-39999"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if r.first != 20000 || r.last != 39999 || r.count() != 20000 {
+		t.Fatalf("got first=%d last=%d count=%d", r.first, r.last, r.count())
+	}
+	if r.String() != "20000-39999" {
+		t.Fatalf("String() = %q", r.String())
+	}
+
+	if err := r.Set("7-7"); err != nil || r.count() != 1 {
+		t.Fatalf("single-mark range: err=%v count=%d", err, r.count())
+	}
+	if err := r.Set("1-65535"); err != nil {
+		t.Fatalf("full 16-bit range should be accepted: %v", err)
+	}
+}
+
+func TestMarkRangeSetRejectsInvalid(t *testing.T) {
+	cases := []string{
+		"",
+		"20000",
+		"a-b",
+		"-5",
+		"5-",
+		"0-10",        // mark 0 means "no mark"
+		"1-65536",     // past the 16-bit HTB classid limit
+		"70000-80000", // entirely past it
+		"10-5",        // reversed
+		"-1-5",
+	}
+	for _, in := range cases {
+		var r markRange
+		if err := r.Set(in); err == nil {
+			t.Errorf("Set(%q): expected error, got first=%d last=%d", in, r.first, r.last)
+		}
 	}
 }

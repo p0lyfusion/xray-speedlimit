@@ -5,6 +5,7 @@ package webhook
 
 import (
 	"log/slog"
+	"maps"
 	"sync"
 )
 
@@ -63,7 +64,14 @@ func (a *Allocator) Allocate(email string) (mark uint32, isNew bool) {
 
 	if !a.exhausted {
 		a.exhausted = true
-		a.log.Warn("webhook mark pool exhausted, continuing without new marks", "base", a.base, "count", a.count)
+		a.log.Warn("mark range exhausted, continuing without new marks", "first", a.base, "last", a.base+a.count-1)
 	}
 	return 0, false
+}
+
+// Marks returns a copy of the current email -> mark assignments.
+func (a *Allocator) Marks() map[string]uint32 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return maps.Clone(a.marks)
 }

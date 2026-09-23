@@ -1,4 +1,4 @@
-package qdisc
+package netif
 
 import (
 	"fmt"

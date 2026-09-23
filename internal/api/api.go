@@ -1,4 +1,5 @@
-// Package api implements the HTTP control plane for the mark -> rate map.
+// Package api implements the HTTP control plane: the mark -> rate map and
+// the email -> mark table.
 package api
 
 import (
@@ -13,21 +14,29 @@ import (
 	"github.com/p0lyfusion/xray-speedlimit/internal/limiter"
 )
 
+// UserMarks reports which mark each user (by email) has been given.
+// webhook.Allocator satisfies this.
+type UserMarks interface {
+	Marks() map[string]uint32
+}
+
 type Server struct {
 	store limiter.Store
+	users UserMarks
 	log   *slog.Logger
 	mux   *http.ServeMux
 }
 
-func New(store limiter.Store, log *slog.Logger) *Server {
+func New(store limiter.Store, users UserMarks, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	s := &Server{store: store, log: log, mux: http.NewServeMux()}
+	s := &Server{store: store, users: users, log: log, mux: http.NewServeMux()}
 
 	s.mux.HandleFunc("PUT /marks/{mark}", s.handleSet)
 	s.mux.HandleFunc("DELETE /marks/{mark}", s.handleDelete)
 	s.mux.HandleFunc("GET /marks", s.handleList)
+	s.mux.HandleFunc("GET /users", s.handleUsers)
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 
 	return s
@@ -55,6 +64,21 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, entries)
 }
 
+// userMark is one entry of the GET /users response.
+type userMark struct {
+	Email string `json:"email"`
+	Mark  uint32 `json:"mark"`
+}
+
+func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
+	users := []userMark{}
+	for email, mark := range s.users.Marks() {
+		users = append(users, userMark{Email: email, Mark: mark})
+	}
+	sort.Slice(users, func(i, j int) bool { return users[i].Mark < users[j].Mark })
+	s.writeJSON(w, http.StatusOK, users)
+}
+
 type setRequest struct {
 	RateBytesPerSec uint64 `json:"rate_bytes_per_sec"`
 }
@@ -79,12 +103,9 @@ func (s *Server) handleSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.RateBytesPerSec > math.MaxUint32 {
-		// SO_MAX_PACING_RATE is only applied through bpf_setsockopt(), which
-		// the kernel accepts exclusively as a 4-byte value
-		// (net/core/filter.c: sol_socket_sockopt requires optlen ==
-		// sizeof(int) for SO_MAX_PACING_RATE), so the effective cap is
+		// Rates are stored as uint32 bytes/sec, so the cap is
 		// math.MaxUint32 bytes/sec (~34.3 Gbit/s).
-		s.writeError(w, http.StatusBadRequest, "rate_bytes_per_sec must not exceed 4294967295 (uint32 limit of SO_MAX_PACING_RATE via bpf_setsockopt)")
+		s.writeError(w, http.StatusBadRequest, "rate_bytes_per_sec must not exceed 4294967295")
 		return
 	}
 
