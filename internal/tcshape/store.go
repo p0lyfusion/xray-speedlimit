@@ -29,26 +29,25 @@ func WrapStore(base limiter.Store, shaper RateShaper, log *slog.Logger) limiter.
 	return &shapedStore{base: base, shaper: shaper, log: log}
 }
 
+// Set applies the rate in tc first and only records it in base once that
+// succeeds, so a tc failure (e.g. a mark outside the 16-bit classid range)
+// never shows up in List as a limit that isn't actually enforced.
 func (s *shapedStore) Set(mark uint32, rate uint32) error {
-	if err := s.base.Set(mark, rate); err != nil {
-		return err
-	}
 	if err := s.shaper.SetRate(mark, rate); err != nil {
 		s.log.Error("tc shaping: failed to apply rate", "mark", mark, "error", err)
 		return err
 	}
-	return nil
+	return s.base.Set(mark, rate)
 }
 
+// Delete removes the tc class first, for the same reason as Set: if that
+// fails, the mark is still limited and must stay in List.
 func (s *shapedStore) Delete(mark uint32) error {
-	if err := s.base.Delete(mark); err != nil {
-		return err
-	}
 	if err := s.shaper.Remove(mark); err != nil {
 		s.log.Error("tc shaping: failed to remove class", "mark", mark, "error", err)
 		return err
 	}
-	return nil
+	return s.base.Delete(mark)
 }
 
 func (s *shapedStore) List() ([]limiter.Entry, error) {
