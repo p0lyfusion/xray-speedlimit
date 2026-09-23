@@ -158,17 +158,17 @@ curl localhost:7070/marks
 [{"mark":20000,"rate_bytes_per_sec":1000000}]
 ```
 
-### `GET /users`: list the email → mark table
+### `GET /users`: list the email → mark table with each user's limit
 
 ```
 curl localhost:7070/users
 ```
 
 ```json
-[{"email":"alice@example.com","mark":20000},{"email":"bob@example.com","mark":20001}]
+[{"email":"alice@example.com","mark":20000,"rate_bytes_per_sec":12500000},{"email":"bob@example.com","mark":20001}]
 ```
 
-Sorted by mark, and `[]` when no user has connected yet. See [Marks](#marks) for what happens to this table on restart.
+`rate_bytes_per_sec` is the mark's current limit, as in `GET /marks`. It's omitted when the mark has no limit, so that user rides the default class. Sorted by mark, and `[]` when no user has connected yet. See [Marks](#marks) for what happens to this table on restart.
 
 ### `GET /healthz`: liveness check
 

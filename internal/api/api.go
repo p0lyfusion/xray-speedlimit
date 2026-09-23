@@ -64,16 +64,28 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, entries)
 }
 
-// userMark is one entry of the GET /users response.
+// userMark is one entry of the GET /users response. RateBytesPerSec is
+// omitted when the user's mark has no limit set (0 is never a valid rate).
 type userMark struct {
-	Email string `json:"email"`
-	Mark  uint32 `json:"mark"`
+	Email           string `json:"email"`
+	Mark            uint32 `json:"mark"`
+	RateBytesPerSec uint32 `json:"rate_bytes_per_sec,omitempty"`
 }
 
 func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
+	entries, err := s.store.List()
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "failed to list marks: "+err.Error())
+		return
+	}
+	rates := make(map[uint32]uint32, len(entries))
+	for _, e := range entries {
+		rates[e.Mark] = e.RateBytesPerSec
+	}
+
 	users := []userMark{}
 	for email, mark := range s.users.Marks() {
-		users = append(users, userMark{Email: email, Mark: mark})
+		users = append(users, userMark{Email: email, Mark: mark, RateBytesPerSec: rates[mark]})
 	}
 	sort.Slice(users, func(i, j int) bool { return users[i].Mark < users[j].Mark })
 	s.writeJSON(w, http.StatusOK, users)

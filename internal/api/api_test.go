@@ -147,7 +147,11 @@ func TestSetUnknownField(t *testing.T) {
 }
 
 func TestUsers(t *testing.T) {
-	s := New(newMemStore(), fakeUsers{"b@example.com": 20001, "a@example.com": 20000}, nil)
+	store := newMemStore()
+	if err := store.Set(20000, 12500000); err != nil {
+		t.Fatal(err)
+	}
+	s := New(store, fakeUsers{"b@example.com": 20001, "a@example.com": 20000}, nil)
 
 	rec := doRequest(t, s, http.MethodGet, "/users", nil)
 	if rec.Code != http.StatusOK {
@@ -157,9 +161,15 @@ func TestUsers(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &users); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	want := []userMark{{"a@example.com", 20000}, {"b@example.com", 20001}}
+	want := []userMark{
+		{Email: "a@example.com", Mark: 20000, RateBytesPerSec: 12500000},
+		{Email: "b@example.com", Mark: 20001},
+	}
 	if !reflect.DeepEqual(users, want) {
 		t.Fatalf("got %+v, want %+v (sorted by mark)", users, want)
+	}
+	if strings.Contains(rec.Body.String(), `"mark":20001,"rate_bytes_per_sec"`) {
+		t.Fatalf("unlimited user should have no rate field: %s", rec.Body.String())
 	}
 }
 
