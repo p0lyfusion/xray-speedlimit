@@ -1,0 +1,56 @@
+package tcshape
+
+import (
+	"log/slog"
+
+	"github.com/p0lyfusion/xray-speedlimit/internal/limiter"
+)
+
+// RateShaper is the subset of *Shaper that WrapStore needs, so tests can
+// substitute a fake.
+type RateShaper interface {
+	SetRate(mark uint32, rateBytesPerSec uint32) error
+	Remove(mark uint32) error
+}
+
+type shapedStore struct {
+	base   limiter.Store
+	shaper RateShaper
+	log    *slog.Logger
+}
+
+// WrapStore wraps base so that every Set/Delete also creates/updates or
+// removes the matching tc/HTB class, keeping the mark->rate store and
+// the enforcement layer in sync.
+func WrapStore(base limiter.Store, shaper RateShaper, log *slog.Logger) limiter.Store {
+	if log == nil {
+		log = slog.Default()
+	}
+	return &shapedStore{base: base, shaper: shaper, log: log}
+}
+
+func (s *shapedStore) Set(mark uint32, rate uint32) error {
+	if err := s.base.Set(mark, rate); err != nil {
+		return err
+	}
+	if err := s.shaper.SetRate(mark, rate); err != nil {
+		s.log.Error("tc shaping: failed to apply rate", "mark", mark, "error", err)
+		return err
+	}
+	return nil
+}
+
+func (s *shapedStore) Delete(mark uint32) error {
+	if err := s.base.Delete(mark); err != nil {
+		return err
+	}
+	if err := s.shaper.Remove(mark); err != nil {
+		s.log.Error("tc shaping: failed to remove class", "mark", mark, "error", err)
+		return err
+	}
+	return nil
+}
+
+func (s *shapedStore) List() ([]limiter.Entry, error) {
+	return s.base.List()
+}

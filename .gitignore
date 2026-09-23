@@ -1,0 +1,4 @@
+/bin/
+*.o
+internal/bpfprog/bpf_bpfel.go
+internal/bpfprog/bpf_bpfeb.go
