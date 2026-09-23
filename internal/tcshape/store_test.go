@@ -86,6 +86,24 @@ func TestWrapStoreSetPropagatesShaperError(t *testing.T) {
 	if err := store.Set(1, 1); err == nil {
 		t.Fatal("expected error from shaper to propagate")
 	}
+	if _, ok := base.entries[1]; ok {
+		t.Fatal("base store must not record a rate that tc failed to apply")
+	}
+}
+
+func TestWrapStoreDeleteKeepsEntryOnShaperError(t *testing.T) {
+	base := newFakeBaseStore()
+	shaper := newFakeShaper()
+	store := WrapStore(base, shaper, nil)
+
+	_ = store.Set(7, 500)
+	shaper.delErr = errors.New("tc failed")
+	if err := store.Delete(7); err == nil {
+		t.Fatal("expected error from shaper to propagate")
+	}
+	if base.entries[7] != 500 {
+		t.Fatal("base store must keep an entry whose tc class could not be removed")
+	}
 }
 
 func TestWrapStoreDeleteRemovesShaping(t *testing.T) {
