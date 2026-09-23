@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -157,19 +156,11 @@ func TestUsers(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rec.Code)
 	}
-	var users []userMark
-	if err := json.Unmarshal(rec.Body.Bytes(), &users); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	want := []userMark{
-		{Email: "a@example.com", Mark: 20000, RateBytesPerSec: 12500000},
-		{Email: "b@example.com", Mark: 20001},
-	}
-	if !reflect.DeepEqual(users, want) {
-		t.Fatalf("got %+v, want %+v (sorted by mark)", users, want)
-	}
-	if strings.Contains(rec.Body.String(), `"mark":20001,"rate_bytes_per_sec"`) {
-		t.Fatalf("unlimited user should have no rate field: %s", rec.Body.String())
+	// Compared as raw JSON so the omitted rate for the unlimited user is
+	// checked too; decoding would turn a missing field into 0.
+	want := `[{"email":"a@example.com","mark":20000,"rate_bytes_per_sec":12500000},{"email":"b@example.com","mark":20001}]`
+	if got := strings.TrimSpace(rec.Body.String()); got != want {
+		t.Fatalf("got %s, want %s (sorted by mark)", got, want)
 	}
 }
 
