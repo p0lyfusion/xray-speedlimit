@@ -111,6 +111,24 @@ func TestHandlerStableMarkAcrossCalls(t *testing.T) {
 	}
 }
 
+// waitFor polls cond until it holds, failing the test after 2 seconds.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func (f *fakeRateSetter) calls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.setCalls
+}
+
 func TestHandlerProvisionsRateOnlyOnFirstAllocation(t *testing.T) {
 	marker := &fakeMarker{}
 	rate := newFakeRateSetter()
@@ -119,6 +137,7 @@ func TestHandlerProvisionsRateOnlyOnFirstAllocation(t *testing.T) {
 	body := `{"email":"user-a","network":"tcp","source":"1.1.1.1:1","inboundLocal":"2.2.2.2:2"}`
 	post(t, h, body)
 	post(t, h, body)
+	waitFor(t, "provisioning", func() bool { _, ok := h.provisioned.Load(uint32(1)); return ok })
 	post(t, h, body)
 
 	marker.mu.Lock()
@@ -135,14 +154,59 @@ func TestHandlerProvisionsRateOnlyOnFirstAllocation(t *testing.T) {
 	}
 }
 
-func TestHandlerRateSetterErrorFailsRequest(t *testing.T) {
+func TestHandlerRateSetterErrorStillMarks(t *testing.T) {
+	marker := &fakeMarker{}
 	rate := newFakeRateSetter()
 	rate.err = errors.New("tc failed")
-	h := New(NewAllocator(1, 10, nil), &fakeMarker{}, rate, 12_500_000, nil)
+	h := New(NewAllocator(1, 10, nil), marker, rate, 12_500_000, nil)
 
 	rec := post(t, h, `{"email":"user-a","source":"1.1.1.1:1","inboundLocal":"2.2.2.2:2"}`)
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("expected 500, got %d", rec.Code)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200: a provisioning failure must not stop marking, got %d", rec.Code)
+	}
+	marker.mu.Lock()
+	defer marker.mu.Unlock()
+	if len(marker.calls) != 1 {
+		t.Fatalf("expected 1 SetMark call, got %d", len(marker.calls))
+	}
+}
+
+// blockingRateSetter blocks every Set until release is closed.
+type blockingRateSetter struct {
+	release chan struct{}
+}
+
+func (b *blockingRateSetter) Set(uint32, uint32) error {
+	<-b.release
+	return nil
+}
+
+func TestHandlerMarksWithoutWaitingForProvisioning(t *testing.T) {
+	marker := &fakeMarker{}
+	rate := &blockingRateSetter{release: make(chan struct{})}
+	defer close(rate.release)
+	h := New(NewAllocator(1, 10, nil), marker, rate, 12_500_000, nil)
+
+	done := make(chan int, 2)
+	for _, email := range []string{"user-a", "user-b"} {
+		go func() {
+			done <- post(t, h, `{"email":"`+email+`","source":"1.1.1.1:1","inboundLocal":"2.2.2.2:2"}`).Code
+		}()
+	}
+	for range 2 {
+		select {
+		case code := <-done:
+			if code != http.StatusOK {
+				t.Fatalf("expected 200, got %d", code)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("webhook blocked on provisioning")
+		}
+	}
+	marker.mu.Lock()
+	defer marker.mu.Unlock()
+	if len(marker.calls) != 2 {
+		t.Fatalf("expected both connections marked while provisioning is stuck, got %d", len(marker.calls))
 	}
 }
 
@@ -152,22 +216,20 @@ func TestHandlerRetriesProvisioningAfterFailure(t *testing.T) {
 	h := New(NewAllocator(1, 10, nil), &fakeMarker{}, rate, 12_500_000, nil)
 
 	body := `{"email":"user-a","source":"1.1.1.1:1","inboundLocal":"2.2.2.2:2"}`
+	notQueued := func() bool { _, ok := h.queued.Load(uint32(1)); return !ok }
 
 	// The allocator hands out the mark for user-a on this first call even
 	// though provisioning then fails, so a naive "only on first allocation"
 	// gate would never retry -- confirm it does.
-	if rec := post(t, h, body); rec.Code != http.StatusInternalServerError {
-		t.Fatalf("expected 500 on first (failing) attempt, got %d", rec.Code)
-	}
+	post(t, h, body)
+	waitFor(t, "the failing attempt", func() bool { return rate.calls() == 1 && notQueued() })
 
 	rate.mu.Lock()
 	rate.err = nil
 	rate.mu.Unlock()
 
-	rec := post(t, h, body)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 once the rate setter recovers, got %d: %s", rec.Code, rec.Body.String())
-	}
+	post(t, h, body)
+	waitFor(t, "the retry", func() bool { return rate.calls() == 2 && notQueued() })
 	rate.mu.Lock()
 	got, ok := rate.rates[1]
 	rate.mu.Unlock()
@@ -176,14 +238,9 @@ func TestHandlerRetriesProvisioningAfterFailure(t *testing.T) {
 	}
 
 	// A third call must not call Set again now that it succeeded once.
-	rec = post(t, h, body)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 on third call, got %d", rec.Code)
-	}
-	rate.mu.Lock()
-	setCalls := rate.setCalls
-	rate.mu.Unlock()
-	if setCalls != 2 {
+	post(t, h, body)
+	time.Sleep(20 * time.Millisecond)
+	if setCalls := rate.calls(); setCalls != 2 {
 		t.Fatalf("expected Set called twice total (failing attempt + successful retry), got %d", setCalls)
 	}
 }
