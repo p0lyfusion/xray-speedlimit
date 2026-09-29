@@ -8,7 +8,7 @@ Xray-core only learns which user owns a connection after it has decrypted and pa
 
 1. Xray-core's stock routing `webhook` action POSTs an event to `/webhook/xray` for every routed connection. The event carries the user's `email` and the client-facing 4-tuple (`source`, `inboundLocal`).
 2. The service gives each `email` its own mark from `-mark-range`. The mark stays the same for as long as the process runs.
-3. It sets that mark on the client connection's conntrack entry over netlink (`ConntrackUpdate`).
+3. It sets that mark on the client connection's conntrack entry over netlink, with one `IPCTNL_MSG_CT_NEW` update keyed by the connection's exact tuple. The kernel finds the entry with a hash lookup, so the cost doesn't grow with the size of the conntrack table. When Xray reports the local address as `0.0.0.0` or `::`, the service tries each address assigned to a local interface in the client's address family and marks every entry it finds. A connection whose local address isn't assigned to an interface (AnyIP routes, TPROXY) can't be marked.
 4. An nftables rule (`ct mark != 0 meta mark set ct mark`, in table `inet xray_speedlimit`) copies the conntrack mark onto each outgoing packet of a marked connection. Packets of unmarked connections keep whatever mark they already had. The service re-applies this table on every start.
 5. A root HTB qdisc on `-iface` has one class plus two `fw` filters (IPv4 and IPv6) per mark, so each user's packets land in their own rate-limited class.
 

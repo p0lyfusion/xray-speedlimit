@@ -79,6 +79,44 @@ func dialLoopback(t *testing.T) (client net.Conn, srcAddr, dstAddr *net.TCPAddr)
 	return client, client.LocalAddr().(*net.TCPAddr), client.RemoteAddr().(*net.TCPAddr)
 }
 
+// assignLoopbackAddr adds ip/32 to lo for the duration of the test,
+// unless it is already assigned (in which case it is left as it is).
+func assignLoopbackAddr(t *testing.T, ip string) {
+	t.Helper()
+	out, err := exec.Command("ip", "-4", "-o", "addr", "show", "dev", "lo").CombinedOutput()
+	if err != nil {
+		t.Skipf("skipping: cannot list lo addresses: %v: %s", err, out)
+	}
+	if strings.Contains(string(out), " "+ip+"/") {
+		return
+	}
+	if out, err := exec.Command("ip", "addr", "add", ip+"/32", "dev", "lo").CombinedOutput(); err != nil {
+		t.Skipf("skipping: cannot add %s to lo: %v: %s", ip, err, out)
+	}
+	t.Cleanup(func() { _ = exec.Command("ip", "addr", "del", ip+"/32", "dev", "lo").Run() })
+}
+
+// findFlow returns the conntrack flow with the given original tuple, or
+// nil.
+func findFlow(t *testing.T, srcIP net.IP, srcPort uint16, dstIP net.IP, dstPort uint16) *netlink.ConntrackFlow {
+	t.Helper()
+	family := netlink.InetFamily(netlink.FAMILY_V4)
+	if srcIP.To4() == nil {
+		family = netlink.FAMILY_V6
+	}
+	flows, err := netlink.ConntrackTableList(netlink.ConntrackTable, family)
+	if err != nil {
+		t.Fatalf("listing conntrack table: %v", err)
+	}
+	for _, f := range flows {
+		if f.Forward.SrcIP.Equal(srcIP) && f.Forward.SrcPort == srcPort &&
+			f.Forward.DstIP.Equal(dstIP) && f.Forward.DstPort == dstPort {
+			return f
+		}
+	}
+	return nil
+}
+
 // skipIfPermissionDenied skips the test if err indicates the process
 // lacks CAP_NET_ADMIN, otherwise fails it with msg as context.
 func skipIfPermissionDenied(t *testing.T, err error, msg string) {
@@ -92,26 +130,19 @@ func skipIfPermissionDenied(t *testing.T, err error, msg string) {
 	t.Fatalf("%s: %v", msg, err)
 }
 
-// requireConntrackMark lists the FAMILY_V4 conntrack table and asserts
+// requireConntrackMark lists the conntrack table and asserts
 // that the flow matching the given 4-tuple exists and carries want as its
 // mark.
 func requireConntrackMark(t *testing.T, srcIP net.IP, srcPort uint16, dstIP net.IP, dstPort uint16, want uint32) {
 	t.Helper()
 
-	flows, err := netlink.ConntrackTableList(netlink.ConntrackTable, netlink.FAMILY_V4)
-	if err != nil {
-		t.Fatalf("listing conntrack table: %v", err)
+	f := findFlow(t, srcIP, srcPort, dstIP, dstPort)
+	if f == nil {
+		t.Fatal("could not find conntrack entry for the test connection after marking")
 	}
-	for _, f := range flows {
-		if f.Forward.SrcIP.Equal(srcIP) && f.Forward.SrcPort == srcPort &&
-			f.Forward.DstIP.Equal(dstIP) && f.Forward.DstPort == dstPort {
-			if f.Mark != want {
-				t.Fatalf("conntrack mark = %d, want %d", f.Mark, want)
-			}
-			return
-		}
+	if f.Mark != want {
+		t.Fatalf("conntrack mark = %d, want %d", f.Mark, want)
 	}
-	t.Fatal("could not find conntrack entry for the test connection after marking")
 }
 
 // TestLiveSetMark opens a real loopback TCP connection, marks it through
@@ -177,6 +208,9 @@ func TestLiveSetMarkMarksAllAmbiguousMatches(t *testing.T) {
 		t.Skip("skipping: must run as root with CAP_NET_ADMIN")
 	}
 	activateConntrack(t)
+	// A wildcard lookup only tries addresses assigned to an interface,
+	// and lo normally only has 127.0.0.1/8.
+	assignLoopbackAddr(t, "127.0.0.2")
 
 	ln1, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
@@ -267,4 +301,108 @@ func TestLiveSetMarkMarksAllAmbiguousMatches(t *testing.T) {
 	if marked != 2 {
 		t.Fatalf("expected both ambiguous flows marked, found %d", marked)
 	}
+}
+
+// TestLiveSetMarkKeepsTimeout checks that marking only changes the mark:
+// an update that also sent CTA_TIMEOUT could leave an established flow
+// about to expire, taking its mark with it.
+func TestLiveSetMarkKeepsTimeout(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("skipping: must run as root with CAP_NET_ADMIN")
+	}
+	activateConntrack(t)
+
+	_, srcAddr, dstAddr := dialLoopback(t)
+	srcPort, dstPort := uint16(srcAddr.Port), uint16(dstAddr.Port)
+
+	m := conntrack.NewMarker(nil)
+	err := m.SetMark("tcp", srcAddr.IP, srcPort, dstAddr.IP, dstPort, 4545)
+	skipIfPermissionDenied(t, err, "SetMark")
+
+	f := findFlow(t, srcAddr.IP, srcPort, dstAddr.IP, dstPort)
+	if f == nil {
+		t.Fatal("could not find conntrack entry for the test connection after marking")
+	}
+	// Established TCP flows default to a 5-day timeout; anything near
+	// zero means the update clobbered it.
+	if f.TimeOut < 3600 {
+		t.Fatalf("conntrack timeout after marking = %ds, want the established timeout left alone", f.TimeOut)
+	}
+}
+
+// TestLiveSetMarkMissCreatesNothing checks that marking a tuple with no
+// conntrack entry fails and doesn't insert one.
+func TestLiveSetMarkMissCreatesNothing(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("skipping: must run as root with CAP_NET_ADMIN")
+	}
+	activateConntrack(t)
+
+	_, srcAddr, dstAddr := dialLoopback(t)
+	// A source port nothing is using: the tuple can't exist.
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	unusedPort := uint16(ln.Addr().(*net.TCPAddr).Port)
+	ln.Close()
+
+	m := conntrack.NewMarker(nil)
+	for _, dst := range []net.IP{dstAddr.IP, net.ParseIP("::")} {
+		err := m.SetMark("tcp", srcAddr.IP, unusedPort, dst, uint16(dstAddr.Port), 4646)
+		if errors.Is(err, unix.EPERM) {
+			skipIfPermissionDenied(t, err, "SetMark")
+		}
+		if err == nil || !strings.Contains(err.Error(), "no conntrack entry") {
+			t.Fatalf("SetMark with dst %s on a missing tuple: got %v, want a no conntrack entry error", dst, err)
+		}
+	}
+	if f := findFlow(t, srcAddr.IP, unusedPort, dstAddr.IP, uint16(dstAddr.Port)); f != nil {
+		t.Fatalf("SetMark on a missing tuple created a conntrack entry: %v", f)
+	}
+}
+
+// TestLiveSetMarkIPv6 marks an IPv6 loopback connection, first by its
+// exact tuple and then through the "::" wildcard.
+func TestLiveSetMarkIPv6(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("skipping: must run as root with CAP_NET_ADMIN")
+	}
+	activateConntrack(t)
+
+	ln, err := net.Listen("tcp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("skipping: no IPv6 loopback: %v", err)
+	}
+	defer ln.Close()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err == nil {
+			accepted <- conn
+		}
+	}()
+	client, err := net.Dial("tcp6", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+	select {
+	case conn := <-accepted:
+		defer conn.Close()
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for accept")
+	}
+	srcAddr, dstAddr := client.LocalAddr().(*net.TCPAddr), client.RemoteAddr().(*net.TCPAddr)
+	srcPort, dstPort := uint16(srcAddr.Port), uint16(dstAddr.Port)
+
+	m := conntrack.NewMarker(nil)
+	err = m.SetMark("tcp", srcAddr.IP, srcPort, dstAddr.IP, dstPort, 4747)
+	skipIfPermissionDenied(t, err, "SetMark over IPv6")
+	requireConntrackMark(t, srcAddr.IP, srcPort, dstAddr.IP, dstPort, 4747)
+
+	if err := m.SetMark("tcp", srcAddr.IP, srcPort, net.ParseIP("::"), dstPort, 4748); err != nil {
+		t.Fatalf("SetMark over IPv6 with wildcard destination: %v", err)
+	}
+	requireConntrackMark(t, srcAddr.IP, srcPort, dstAddr.IP, dstPort, 4748)
 }

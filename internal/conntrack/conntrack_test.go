@@ -39,109 +39,64 @@ func TestIPFamilyOf(t *testing.T) {
 	}
 }
 
-func TestFindFlowsExactMatch(t *testing.T) {
-	flows := []*netlink.ConntrackFlow{
-		{
-			Forward: netlink.IPTuple{
-				SrcIP: net.ParseIP("203.0.113.7"), SrcPort: 54203,
-				DstIP: net.ParseIP("198.51.100.1"), DstPort: 443,
-				Protocol: unix.IPPROTO_TCP,
-			},
-		},
-		{
-			Forward: netlink.IPTuple{
-				SrcIP: net.ParseIP("203.0.113.8"), SrcPort: 1,
-				DstIP: net.ParseIP("198.51.100.1"), DstPort: 443,
-				Protocol: unix.IPPROTO_TCP,
-			},
-		},
+func TestCandidateDstsSpecified(t *testing.T) {
+	local := []net.IP{net.ParseIP("198.51.100.1"), net.ParseIP("198.51.100.2")}
+
+	got := candidateDsts(net.ParseIP("198.51.100.1"), netlink.FAMILY_V4, local)
+	if len(got) != 1 || !got[0].Equal(net.ParseIP("198.51.100.1")) || len(got[0]) != net.IPv4len {
+		t.Fatalf("expected only the given 4-byte destination, got %v", got)
 	}
 
-	matches := findFlows(flows, unix.IPPROTO_TCP, net.ParseIP("203.0.113.7"), 54203, net.ParseIP("198.51.100.1"), 443)
-	if len(matches) != 1 || matches[0] != flows[0] {
-		t.Fatalf("expected exactly the first flow to match, got %+v", matches)
+	// A known destination is used as is even if it isn't a local address.
+	got = candidateDsts(net.ParseIP("203.0.113.9"), netlink.FAMILY_V4, local)
+	if len(got) != 1 || !got[0].Equal(net.ParseIP("203.0.113.9")) {
+		t.Fatalf("expected the given destination, got %v", got)
 	}
 
-	if matches := findFlows(flows, unix.IPPROTO_TCP, net.ParseIP("203.0.113.9"), 1, net.ParseIP("198.51.100.1"), 443); len(matches) != 0 {
-		t.Fatalf("expected no match, got %+v", matches)
+	if got := candidateDsts(net.ParseIP("2001:db8::1"), netlink.FAMILY_V4, local); len(got) != 0 {
+		t.Fatalf("expected no candidates for a destination of the wrong family, got %v", got)
 	}
 }
 
-func TestFindFlowsNilDestinationMatchesWildcardCase(t *testing.T) {
-	// Mirrors the real fallback: dstIP is nil (destination unknown/unusable),
-	// so only the source 4-tuple plus destination port need to match.
-	flows := []*netlink.ConntrackFlow{
-		{
-			Forward: netlink.IPTuple{
-				SrcIP: net.ParseIP("5.44.39.162"), SrcPort: 51234,
-				DstIP: net.ParseIP("5.129.238.61"), DstPort: 443,
-				Protocol: unix.IPPROTO_TCP,
-			},
-		},
+func TestCandidateDstsWildcardUsesSourceFamily(t *testing.T) {
+	local := []net.IP{
+		net.ParseIP("127.0.0.1"),
+		net.ParseIP("::1"),
+		net.ParseIP("198.51.100.1"),
+		net.ParseIP("2001:db8::1"),
+		net.ParseIP("198.51.100.2"),
 	}
 
-	matches := findFlows(flows, unix.IPPROTO_TCP, net.ParseIP("5.44.39.162"), 51234, nil, 443)
-	if len(matches) != 1 || matches[0] != flows[0] {
-		t.Fatalf("expected the flow to match by source+dstPort alone, got %+v", matches)
+	// Xray reports "::" for IPv4 clients too; the family comes from the
+	// source, not from the wildcard.
+	for _, wildcard := range []string{"::", "0.0.0.0"} {
+		got := candidateDsts(net.ParseIP(wildcard), netlink.FAMILY_V4, local)
+		want := []string{"127.0.0.1", "198.51.100.1", "198.51.100.2"}
+		if len(got) != len(want) {
+			t.Fatalf("%s: got %v, want %v", wildcard, got, want)
+		}
+		for i := range want {
+			if got[i].String() != want[i] || len(got[i]) != net.IPv4len {
+				t.Fatalf("%s: got %v, want %v", wildcard, got, want)
+			}
+		}
+	}
+
+	got := candidateDsts(net.ParseIP("::"), netlink.FAMILY_V6, local)
+	if len(got) != 2 || got[0].String() != "::1" || got[1].String() != "2001:db8::1" {
+		t.Fatalf("expected the IPv6 local addresses, got %v", got)
 	}
 }
 
-func TestFindFlowsRequiresDestinationIPWhenKnown(t *testing.T) {
-	// Regression test for a multi-homed host: the same client source
-	// 4-tuple can legally appear twice if it's connected to two different
-	// local IPs on this box (the OS only needs the destination IP to
-	// differ for both tuples to be valid simultaneously). When a real
-	// destination IP is available, it must still be used to pick the
-	// right one -- dropping it unconditionally would let a webhook for
-	// one connection mark the other by mistake.
-	wantFlow := &netlink.ConntrackFlow{
-		Forward: netlink.IPTuple{
-			SrcIP: net.ParseIP("203.0.113.7"), SrcPort: 54203,
-			DstIP: net.ParseIP("198.51.100.1"), DstPort: 443,
-			Protocol: unix.IPPROTO_TCP,
-		},
+func TestCandidateDstsMappedSource(t *testing.T) {
+	// An IPv4-mapped source resolves to FAMILY_V4, so it must be looked
+	// up against the IPv4 local addresses.
+	family, _, err := ipFamilyOf(net.ParseIP("::ffff:203.0.113.7"))
+	if err != nil || family != netlink.FAMILY_V4 {
+		t.Fatalf("ipFamilyOf(mapped) = %v, %v", family, err)
 	}
-	otherFlow := &netlink.ConntrackFlow{
-		Forward: netlink.IPTuple{
-			SrcIP: net.ParseIP("203.0.113.7"), SrcPort: 54203,
-			DstIP: net.ParseIP("198.51.100.2"), DstPort: 443,
-			Protocol: unix.IPPROTO_TCP,
-		},
-	}
-	flows := []*netlink.ConntrackFlow{otherFlow, wantFlow}
-
-	matches := findFlows(flows, unix.IPPROTO_TCP, net.ParseIP("203.0.113.7"), 54203, net.ParseIP("198.51.100.1"), 443)
-	if len(matches) != 1 || matches[0] != wantFlow {
-		t.Fatalf("expected to pick only the flow matching the real destination IP, got %+v", matches)
-	}
-}
-
-func TestFindFlowsReturnsAllMatchesWithUnknownDestination(t *testing.T) {
-	// Same multi-homed collision as above, but this time the destination
-	// IP is unknown (nil). Both flows must be returned: SetMark marks all
-	// of them rather than guessing, since on a multi-homed host a user can
-	// trivially self-trigger this ambiguity (bind an explicit local port,
-	// open two connections to two different local IPs on the same port)
-	// and both connections genuinely belong to that same user/mark --
-	// marking only one would leave the other free to bypass its cap.
-	flowA := &netlink.ConntrackFlow{
-		Forward: netlink.IPTuple{
-			SrcIP: net.ParseIP("203.0.113.7"), SrcPort: 54203,
-			DstIP: net.ParseIP("198.51.100.1"), DstPort: 443,
-			Protocol: unix.IPPROTO_TCP,
-		},
-	}
-	flowB := &netlink.ConntrackFlow{
-		Forward: netlink.IPTuple{
-			SrcIP: net.ParseIP("203.0.113.7"), SrcPort: 54203,
-			DstIP: net.ParseIP("198.51.100.2"), DstPort: 443,
-			Protocol: unix.IPPROTO_TCP,
-		},
-	}
-	flows := []*netlink.ConntrackFlow{flowA, flowB}
-
-	matches := findFlows(flows, unix.IPPROTO_TCP, net.ParseIP("203.0.113.7"), 54203, nil, 443)
-	if len(matches) != 2 || matches[0] != flowA || matches[1] != flowB {
-		t.Fatalf("expected both flows returned, got %+v", matches)
+	got := candidateDsts(net.ParseIP("::"), family, []net.IP{net.ParseIP("::1"), net.ParseIP("198.51.100.1")})
+	if len(got) != 1 || got[0].String() != "198.51.100.1" {
+		t.Fatalf("expected the IPv4 local address, got %v", got)
 	}
 }
