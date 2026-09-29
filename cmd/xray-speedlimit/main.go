@@ -34,11 +34,11 @@ type config struct {
 	webhookAddr          string
 	iface                string
 	txQueues             int
-	markRange            string
 	defaultClassRateMbit uint64
 	htbBurstMs           uint64
 	perUserRateMbit      uint64
 	classIdleTimeout     time.Duration
+	remarkAfter          time.Duration
 }
 
 func main() {
@@ -48,10 +48,10 @@ func main() {
 	flag.StringVar(&cfg.webhookAddr, "webhook-addr", "@xray-speedlimit-webhook", "listen address for the Xray webhook receiver, separate from -addr since this is hit on every new connection: host:port, a filesystem Unix socket path, or a Linux abstract socket (@name, or @@name padded for HAProxy compatibility) — abstract is the default and fastest, and needs no bind mount across a --network host container boundary")
 	flag.StringVar(&cfg.iface, "iface", "", "network interface for tc/HTB shaping (default: the interface used by the default route)")
 	flag.IntVar(&cfg.txQueues, "tx-queues", 0, "number of TX queues to spread users over, one HTB qdisc each (at most 255); 0 = every TX queue -iface has in use. Every user's mark depends on it")
-	flag.StringVar(&cfg.markRange, "mark-range", "", "no longer used: marks are computed from the email (see -tx-queues); accepted and ignored so older configs keep working")
 	flag.Uint64Var(&cfg.defaultClassRateMbit, "default-class-rate-mbit", 0, "rate (Mbit/s) for the tc/HTB default class, which catches all traffic with no per-user mark (system traffic, and every user's own outbound-to-destination leg); 0 = auto-detect via ethtool on -iface")
 	flag.Uint64Var(&cfg.htbBurstMs, "htb-burst-ms", 100, "burst/cburst allowance for every tc/HTB class (default and per-user), in milliseconds' worth of bytes at that class's own rate; 0 = kernel's own default sizing (normally just a couple KB)")
 	flag.Uint64Var(&cfg.perUserRateMbit, "per-user-rate-mbit", 0, "if set, automatically provisions this rate (Mbit/s) for every user's mark the first time it is seen, applying it uniformly to every user with zero manual provisioning; 0 = don't auto-provision, manage rates by hand via PUT /marks/{mark}")
+	flag.DurationVar(&cfg.remarkAfter, "remark-after", 10*time.Second, "don't mark a connection again when another webhook for it arrives within this long of the last successful mark; saves most of the work on multiplexing transports (XHTTP, mux), which send a webhook per sub-request. A connection that closes and is reopened from the same client port within this long stays unmarked until it passes. 0 = mark on every webhook")
 	flag.DurationVar(&cfg.classIdleTimeout, "class-idle-timeout", 6*time.Hour, "delete a user's tc/HTB class after it has sent nothing for this long (the user gets a new one on their next connection), and drop emails idle that long from GET /users; 0 = never delete classes, and GET /users keeps every email seen")
 	flag.Parse()
 
@@ -64,10 +64,6 @@ func main() {
 }
 
 func run(cfg config, log *slog.Logger) error {
-	if cfg.markRange != "" {
-		log.Warn("-mark-range is no longer used and is ignored: marks are computed from the email", "mark_range", cfg.markRange)
-	}
-
 	iface := cfg.iface
 	if iface == "" {
 		var err error
@@ -136,7 +132,7 @@ func run(cfg config, log *slog.Logger) error {
 	}
 
 	users := webhook.NewUsers(queues)
-	handler := webhook.New(users, conntrack.NewMarker(log), perUserRate, perUserRateBytesPerSec, log)
+	handler := webhook.New(users, conntrack.NewMarker(log), perUserRate, perUserRateBytesPerSec, cfg.remarkAfter, log)
 
 	apiSrv := &http.Server{Handler: api.New(store, users, log), ReadHeaderTimeout: readHeaderTimeout}
 

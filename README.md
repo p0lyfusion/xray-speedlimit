@@ -8,7 +8,7 @@ Xray-core only learns which user owns a connection after it has decrypted and pa
 
 1. Xray-core's stock routing `webhook` action POSTs an event to `/webhook/xray` for every routed connection. The event carries the user's `email` and the client-facing 4-tuple (`source`, `inboundLocal`).
 2. The service computes the user's mark from their `email` (see [Marks](#marks)). The same email always gets the same mark, across restarts too.
-3. It sets that mark on the client connection's conntrack entry over netlink, with one `IPCTNL_MSG_CT_NEW` update keyed by the connection's exact tuple. The kernel finds the entry with a hash lookup, so the cost doesn't grow with the size of the conntrack table. When Xray reports the local address as `0.0.0.0` or `::`, the service tries each address assigned to a local interface in the client's address family and marks every entry it finds. A connection whose local address isn't assigned to an interface (AnyIP routes, TPROXY) can't be marked.
+3. It sets that mark on the client connection's conntrack entry over netlink, with one `IPCTNL_MSG_CT_NEW` update keyed by the connection's exact tuple. The kernel finds the entry with a hash lookup, so the cost doesn't grow with the size of the conntrack table. When Xray reports the local address as `0.0.0.0` or `::`, the service tries each address assigned to a local interface in the client's address family and marks every entry it finds. All of those updates go to the kernel in one system call, on a netlink socket kept open between webhooks. A connection whose local address isn't assigned to an interface (AnyIP routes, TPROXY) can't be marked.
 4. An nftables rule (`ct mark != 0 meta mark set ct mark`, in table `inet xray_speedlimit`) copies the conntrack mark onto each outgoing packet of a marked connection. Packets of unmarked connections keep whatever mark they already had. The service re-applies this table on every start.
 5. On `-iface`, an `mq` root qdisc gives every TX queue its own HTB qdisc. A clsact egress filter moves each marked packet onto the TX queue its mark names, and that queue's HTB puts it in the user's rate-limited class.
 
@@ -129,7 +129,8 @@ The service then:
 
 1. Computes the mark `0x171909` (step 1).
 2. Checks the store for a rate on `0x171909`. If there is none, it queues the mark for the background provisioning worker, which runs the `tc class replace` above. The webhook doesn't wait for it.
-3. Writes `mark=0x171909` onto the connection's conntrack entry. `inboundLocal` is `[::]`, which says nothing about the local address, so it tries each IPv4 address assigned to the host, one exact-tuple lookup each, until it hits the entry for `203.0.113.7:20416 → 198.51.100.1:443`.
+3. Skips the rest if it marked this same connection (`203.0.113.7:20416` → `[::]:443`, mark `0x171909`) less than `-remark-after` ago. See [Repeated webhooks](#repeated-webhooks).
+4. Writes `mark=0x171909` onto the connection's conntrack entry. `inboundLocal` is `[::]`, which says nothing about the local address, so it sends one exact-tuple lookup per IPv4 address assigned to the host, all in one system call, and one of them hits the entry for `203.0.113.7:20416 → 198.51.100.1:443`.
 
 #### 4. A packet goes out
 
@@ -222,6 +223,45 @@ With `-per-user-rate-mbit`, a class the service finds at startup is only adopted
 
 To roll back to a version from before this layout, delete the root qdisc first (`tc qdisc del dev <iface> root`). Those versions decide whether their tree exists by looking for an `htb 1:` qdisc, which this layout also contains (under TX queue 0), and would otherwise put every class under that one queue.
 
+### Repeated webhooks
+
+Xray sends a webhook for every *routed* connection. With a plain TCP transport (raw, REALITY, TLS over TCP) that is one per client TCP connection. Transports that multiplex (XHTTP, mux) route every sub-request separately, so one client TCP connection produces a stream of webhooks, all with the same `source` and `inboundLocal`. The conntrack entry already carries the mark after the first one, so the service remembers each connection it marked (source, local address, mark) for `-remark-after` (10 seconds by default) and answers repeats without touching the kernel.
+
+Measured on an XHTTP server (about 5,000 users, 2,450 webhooks a second, two minutes of traffic replayed against different windows):
+
+| `-remark-after` | 1s | 5s | 10s | 30s | 60s |
+|---|---|---|---|---|---|
+| webhooks that skip the kernel | 63% | 78% | 83% | 88% | 91% |
+
+The gain flattens after about 10 seconds, while the risk below grows with the window, hence the default.
+
+The risk: if the same user opens a new connection from the same client IP:port within the window, the new conntrack entry starts unmarked and the cache skips it, so it runs unshaped (above the limit, never blocked).
+
+- **XHTTP / mux:** that connection keeps sending webhooks, so it is marked at the latest one window later. Most webhooks are repeats, so this is where the cache pays off.
+- **Plain TCP transports (raw, REALITY, TLS over TCP):** a connection sends one webhook, so a connection skipped this way stays unshaped for its whole life, and the cache rarely hits anyway. **Use `-remark-after 0` on these hosts.**
+
+Reuse of a port by a *different* user is harmless: the mark is part of the key. A failed mark is never remembered, so the next webhook for that connection tries again.
+
+To size the window for another host, replay its Xray access log (one `accepted` line per webhook): group lines by source IP:port and email, and count how many arrive less than the window after the last one that would have been marked.
+
+### Relays and HAProxy
+
+The service marks the conntrack entry whose tuple is the webhook's `source` → `inboundLocal`. That only works if Xray reports the addresses of a real TCP connection on this host, and that connection carries one user's traffic out of `-iface`. With a proxy in front of Xray:
+
+| Setup | Xray's `source` | Result |
+|---|---|---|
+| HAProxy on the same host, TCP mode, PROXY protocol (`acceptProxyProtocol`) | client IP:port, `inboundLocal` = host:443 | Works. That tuple is the client → HAProxy connection, whose packets to the client are the ones to shape. |
+| HAProxy on the same host, TCP mode, no PROXY protocol | `127.0.0.1:port` | Doesn't shape: the loopback connection is marked, and loopback traffic never leaves through `-iface`. |
+| HAProxy on the same host, to Xray over a Unix socket | no IP | Nothing is marked. |
+| Relay on another host, TCP mode, no PROXY protocol | relay IP:port | Works: one relay → backend connection per client, shaped on the backend's egress towards the relay. |
+| Relay on another host, PROXY protocol | client IP:port | Every mark fails: the backend's conntrack only knows the relay's address. |
+| HTTP mode with `X-Forwarded-For` (`trustedXForwardedFor`) | client IP, port 0 | Every mark fails: Xray drops the port, so no connection matches. |
+| HTTP mode, relay reuses backend connections (`http-reuse`) | relay IP:port | Wrong: one backend connection carries several users, and its mark follows whichever user's webhook came last. |
+
+So: keep HAProxy in TCP mode with one backend connection per client. With HAProxy on the same host, enable PROXY protocol on both sides; with a relay on another host, leave it off. Set `-iface` to the interface the relay's traffic arrives on if that isn't the default route's (a private network, WireGuard). A relay reuses its own ports far more often than a client does, so on relay backends keep `-remark-after` to a few seconds, or 0.
+
+A failed mark is never remembered, so the next webhook for that connection tries again.
+
 ### The webhook listener
 
 The webhook receiver has its own listener, `-webhook-addr`, separate from `-addr`, because it's hit on every new connection Xray routes.
@@ -257,7 +297,7 @@ Add a routing rule with a `webhook` that matches the traffic you want to limit:
 ```
 
 - Put the request path after a `:` when the URL is a Unix socket.
-- `deduplication` must be `0`. Xray deduplicates per `email`, so any other value means only a user's first connection in each window gets marked.
+- `deduplication` must be `0`. Xray deduplicates per `email`, so any other value means only a user's first connection in each window gets marked. The service does its own per-connection deduplication instead; see [Repeated webhooks](#repeated-webhooks).
 - Xray delivers webhooks fire-and-forget, with no retry. If a POST is lost, that connection runs uncapped for its whole life.
 
 ## Running it
@@ -288,8 +328,6 @@ The image includes `iproute2` (`tc`), `nftables` and `ethtool`, which the servic
 -tx-queues int
       number of TX queues to spread users over, one HTB qdisc each (at most 255);
       0 = every TX queue -iface has in use
--mark-range string
-      no longer used: accepted and ignored so older configs keep working
 -default-class-rate-mbit uint
       rate (Mbit/s) for each queue's tc/HTB default class; 0 = auto-detect via
       ethtool on -iface
@@ -303,6 +341,9 @@ The image includes `iproute2` (`tc`), `nftables` and `ethtool`, which the servic
       delete a user's class after it has sent nothing for this long, and drop
       emails idle that long from GET /users; 0 = never, and GET /users keeps
       every email seen (default 6h0m0s)
+-remark-after duration
+      don't mark a connection again when another webhook for it arrives within
+      this long; see Repeated webhooks; 0 = mark on every webhook (default 10s)
 ```
 
 ## HTTP API
@@ -356,7 +397,7 @@ curl localhost:7070/healthz
 
 ### `POST /webhook/xray`: Xray-core webhook receiver
 
-Served on `-webhook-addr`, not `-addr`. It isn't meant to be called by hand; point Xray-core's `routing.rules[].webhook.url` at it.
+Served on `-webhook-addr`, not `-addr`. It isn't meant to be called by hand; point Xray-core's `routing.rules[].webhook.url` at it. It answers `204 No Content` when the connection is marked, or when the event is one it ignores (no email, not TCP); `400` for a body that isn't JSON; and `500` when the connection couldn't be marked.
 
 ## Building from source
 

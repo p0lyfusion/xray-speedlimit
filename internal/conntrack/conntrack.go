@@ -4,7 +4,6 @@
 package conntrack
 
 import (
-	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -24,6 +23,9 @@ const localAddrsTTL = 5 * time.Second
 // its 4-tuple.
 type Marker struct {
 	log *slog.Logger
+	// sockets holds idle netlink sockets for reuse, so a SetMark costs a
+	// sendmsg and a recvmsg rather than a socket's whole lifecycle.
+	sockets chan *ctSocket
 
 	addrsMu      sync.Mutex
 	addrs        []net.IP
@@ -35,15 +37,16 @@ func NewMarker(log *slog.Logger) *Marker {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Marker{log: log}
+	return &Marker{log: log, sockets: make(chan *ctSocket, socketPoolSize)}
 }
 
 // SetMark finds the conntrack entry (or entries) matching the given
 // source 4-tuple, and updates their mark. proto is currently limited to
 // "tcp".
 //
-// Each lookup is a single ctnetlink update keyed by the exact original
-// tuple, which the kernel resolves with a hash lookup. SetMark never
+// Each lookup is a ctnetlink update keyed by the exact original tuple,
+// which the kernel resolves with a hash lookup. All of a call's lookups go
+// to the kernel in one sendmsg on a reused socket. SetMark never
 // dumps the conntrack table: on a busy host that table holds hundreds of
 // thousands of entries, and dumping it per webhook costs far more CPU and
 // memory than the shaping is worth.
@@ -83,16 +86,32 @@ func (m *Marker) SetMark(proto string, srcIP net.IP, srcPort uint16, dstIP net.I
 		}
 	}
 
+	dsts := candidateDsts(dstIP, family, local)
+	reqs := make([]*nl.NetlinkRequest, len(dsts))
+	for i, dst := range dsts {
+		reqs[i] = markRequest(uint8(family), protoNum, srcIP, srcPort, dst, dstPort, mark)
+	}
+
 	marked := 0
-	for _, dst := range candidateDsts(dstIP, family, local) {
-		err := updateMark(family, protoNum, srcIP, srcPort, dst, dstPort, mark)
-		if errors.Is(err, unix.ENOENT) {
-			continue
-		}
+	if len(reqs) > 0 {
+		sock, err := m.getSocket()
 		if err != nil {
-			return fmt.Errorf("updating conntrack mark: %w", err)
+			return fmt.Errorf("opening netlink socket: %w", err)
 		}
-		marked++
+		results, err := sock.exchange(reqs)
+		if err != nil {
+			sock.close()
+			return err
+		}
+		m.putSocket(sock)
+		for _, err := range results {
+			switch {
+			case err == nil:
+				marked++
+			case !errNoEntry(err):
+				return fmt.Errorf("updating conntrack mark: %w", err)
+			}
+		}
 	}
 
 	if marked == 0 {
@@ -146,41 +165,6 @@ func candidateDsts(dstIP net.IP, family netlink.InetFamily, local []net.IP) []ne
 		}
 	}
 	return dsts
-}
-
-// updateMark sets mark on the conntrack entry whose original tuple is
-// exactly the one given, returning an error wrapping unix.ENOENT if there
-// is none. The request carries only the tuple and CTA_MARK, so the kernel
-// leaves every other attribute alone. netlink.ConntrackUpdate isn't used
-// because it always sends CTA_TIMEOUT and the reply tuple, which would
-// need a dump to fill in. NLM_F_CREATE is left out so a miss can't insert
-// an entry.
-func updateMark(family netlink.InetFamily, proto uint8, srcIP net.IP, srcPort uint16, dstIP net.IP, dstPort uint16, mark uint32) error {
-	srcAttr, dstAttr := nl.CTA_IP_V4_SRC, nl.CTA_IP_V4_DST
-	if family == netlink.FAMILY_V6 {
-		srcAttr, dstAttr = nl.CTA_IP_V6_SRC, nl.CTA_IP_V6_DST
-	}
-
-	tupleIP := nl.NewRtAttr(unix.NLA_F_NESTED|nl.CTA_TUPLE_IP, nil)
-	tupleIP.AddChild(nl.NewRtAttr(srcAttr, srcIP))
-	tupleIP.AddChild(nl.NewRtAttr(dstAttr, dstIP))
-
-	tupleProto := nl.NewRtAttr(unix.NLA_F_NESTED|nl.CTA_TUPLE_PROTO, nil)
-	tupleProto.AddChild(nl.NewRtAttr(nl.CTA_PROTO_NUM, []byte{proto}))
-	tupleProto.AddChild(nl.NewRtAttr(nl.CTA_PROTO_SRC_PORT, nl.BEUint16Attr(srcPort)))
-	tupleProto.AddChild(nl.NewRtAttr(nl.CTA_PROTO_DST_PORT, nl.BEUint16Attr(dstPort)))
-
-	tupleOrig := nl.NewRtAttr(unix.NLA_F_NESTED|nl.CTA_TUPLE_ORIG, nil)
-	tupleOrig.AddChild(tupleIP)
-	tupleOrig.AddChild(tupleProto)
-
-	req := nl.NewNetlinkRequest(int(netlink.ConntrackTable)<<8|nl.IPCTNL_MSG_CT_NEW, unix.NLM_F_ACK)
-	req.AddData(&nl.Nfgenmsg{NfgenFamily: uint8(family), Version: nl.NFNETLINK_V0})
-	req.AddData(tupleOrig)
-	req.AddData(nl.NewRtAttr(nl.CTA_MARK, nl.BEUint32Attr(mark)))
-
-	_, err := req.Execute(unix.NETLINK_NETFILTER, 0)
-	return err
 }
 
 func protocolNumber(proto string) (uint8, error) {

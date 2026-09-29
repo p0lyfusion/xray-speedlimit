@@ -2,20 +2,13 @@ package webhook
 
 import (
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
-	"strconv"
-	"strings"
+	"net/netip"
 	"sync"
-	"sync/atomic"
 	"time"
 )
-
-// missDiagnoseInterval is the minimum gap between two diagnoses of a
-// connection the Marker couldn't mark. Each one dumps kernel tables.
-const missDiagnoseInterval = 30 * time.Second
 
 // provisionQueueSize bounds how many marks can wait for provisioning. A
 // mark that doesn't fit is queued again by its next webhook.
@@ -23,22 +16,13 @@ const provisionQueueSize = 16384
 
 // Marker marks a live connection so downstream enforcement (e.g. tc/HTB)
 // can act on it. Handler passes dstIP straight through from Xray-core's
-// InboundLocal (see parseHostPort below), which is unreliable for some
-// inbound/transport combinations and reports the address-family wildcard
-// (0.0.0.0 / ::) instead of the real local IP — see conntrack.Marker's
+// InboundLocal, which is unreliable for some inbound/transport
+// combinations and reports the address-family wildcard (0.0.0.0 / ::)
+// instead of the real local IP — see conntrack.Marker's
 // implementation for why that's a known, tolerated shape of input, not
 // invalid data callers need to filter out first.
 type Marker interface {
 	SetMark(proto string, srcIP net.IP, srcPort uint16, dstIP net.IP, dstPort uint16, mark uint32) error
-}
-
-// MissDiagnoser is optionally implemented by a Marker that can explain
-// why SetMark found nothing. DiagnoseMiss is expensive, so Handler calls
-// it at most once per missDiagnoseInterval, in the background, right
-// after a failure so the connection is most likely still alive. It
-// returns slog key/value pairs.
-type MissDiagnoser interface {
-	DiagnoseMiss(srcIP net.IP, srcPort, dstPort uint16) ([]any, error)
 }
 
 // RateSetter applies a bandwidth cap to a mark (e.g. by creating/updating
@@ -68,6 +52,7 @@ type Handler struct {
 	marker                 Marker
 	rate                   RateSetter
 	perUserRateBytesPerSec uint32
+	recent                 *recentMarks
 	log                    *slog.Logger
 
 	// queued records marks waiting in provisionQueue (mark -> struct{}),
@@ -75,10 +60,6 @@ type Handler struct {
 	queued sync.Map
 	// provisionQueue feeds provisionLoop.
 	provisionQueue chan uint32
-
-	// lastDiagnose is when the last miss diagnosis started, in Unix
-	// nanoseconds.
-	lastDiagnose atomic.Int64
 }
 
 // New creates a webhook Handler. If rate is non-nil, every mark seen that
@@ -86,7 +67,11 @@ type Handler struct {
 // rate.Set, so per-user limits apply uniformly without any external
 // provisioning step. Pass a nil rate to manage rates by hand instead
 // (e.g. via the HTTP API).
-func New(users *Users, marker Marker, rate RateSetter, perUserRateBytesPerSec uint32, log *slog.Logger) *Handler {
+//
+// A connection marked less than remarkAfter ago isn't marked again when
+// another webhook for it arrives (see recentMarks); 0 marks on every
+// webhook.
+func New(users *Users, marker Marker, rate RateSetter, perUserRateBytesPerSec uint32, remarkAfter time.Duration, log *slog.Logger) *Handler {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -95,6 +80,7 @@ func New(users *Users, marker Marker, rate RateSetter, perUserRateBytesPerSec ui
 		marker:                 marker,
 		rate:                   rate,
 		perUserRateBytesPerSec: perUserRateBytesPerSec,
+		recent:                 newRecentMarks(remarkAfter),
 		log:                    log,
 	}
 	if rate != nil {
@@ -151,13 +137,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	srcIP, srcPort, err := parseHostPort(*ev.Source)
+	src, err := parseAddrPort(*ev.Source)
 	if err != nil {
 		h.log.Warn("webhook: unparsable source", "source", *ev.Source, "error", err)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	dstIP, dstPort, err := parseHostPort(*ev.InboundLocal)
+	dst, err := parseAddrPort(*ev.InboundLocal)
 	if err != nil {
 		h.log.Warn("webhook: unparsable inboundLocal", "inboundLocal", *ev.InboundLocal, "error", err)
 		w.WriteHeader(http.StatusNoContent)
@@ -174,76 +160,29 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.queueProvision(mark)
 	}
 
-	if err := h.marker.SetMark("tcp", srcIP, srcPort, dstIP, dstPort, mark); err != nil {
+	conn := markedConn{src: src, dst: dst, mark: mark}
+	if h.recent.contains(conn) {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if err := h.marker.SetMark("tcp", net.IP(src.Addr().AsSlice()), src.Port(), net.IP(dst.Addr().AsSlice()), dst.Port(), mark); err != nil {
 		h.log.Error("webhook: failed to set conntrack mark", "email", *ev.Email, "mark", mark, "error", err)
-		h.maybeDiagnose(*ev.Email, *ev.Source, srcIP, srcPort, dstPort)
 		http.Error(w, "failed to set conntrack mark", http.StatusInternalServerError)
 		return
 	}
+	h.recent.add(conn)
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(struct {
-		Email string `json:"email"`
-		Mark  uint32 `json:"mark"`
-	}{Email: *ev.Email, Mark: mark})
+	// Xray ignores the response body.
+	w.WriteHeader(http.StatusNoContent)
 }
 
-// maybeDiagnose starts a background diagnosis of a failed mark if the
-// marker supports it and none has started in the last
-// missDiagnoseInterval.
-func (h *Handler) maybeDiagnose(email, source string, srcIP net.IP, srcPort, dstPort uint16) {
-	d, ok := h.marker.(MissDiagnoser)
-	if !ok {
-		return
-	}
-	now := time.Now().UnixNano()
-	last := h.lastDiagnose.Load()
-	if now-last < int64(missDiagnoseInterval) || !h.lastDiagnose.CompareAndSwap(last, now) {
-		return
-	}
-	go func() {
-		attrs, err := d.DiagnoseMiss(srcIP, srcPort, dstPort)
-		if err != nil {
-			h.log.Warn("webhook: diagnosing unmarked connection failed", "source", source, "error", err)
-			return
-		}
-		h.log.Warn("webhook: diagnosis of unmarked connection",
-			append([]any{"email", email, "source", source, "dst_port", dstPort}, attrs...)...)
-	}()
-}
-
-// parseHostPort parses xray-core's "ip:port" address fields. It also
-// tolerates an optional "proto:" prefix (as used by net.Destination's
-// String() elsewhere in xray-core) in case a differently-shaped address
-// ends up in these fields.
-func parseHostPort(s string) (net.IP, uint16, error) {
-	host, portStr, err := net.SplitHostPort(s)
-	var ip net.IP
-	if err == nil {
-		ip = net.ParseIP(host)
-	}
-
-	if ip == nil {
-		if idx := strings.IndexByte(s, ':'); idx >= 0 && idx+1 < len(s) {
-			if h2, p2, err2 := net.SplitHostPort(s[idx+1:]); err2 == nil {
-				if ip2 := net.ParseIP(h2); ip2 != nil {
-					host, portStr, ip, err = h2, p2, ip2, nil
-				}
-			}
-		}
-	}
-
-	if ip == nil {
-		if err == nil {
-			err = fmt.Errorf("invalid address %q", s)
-		}
-		return nil, 0, err
-	}
-
-	port, err := strconv.ParseUint(portStr, 10, 16)
+// parseAddrPort parses xray-core's "ip:port" address fields, which it
+// builds with net.JoinHostPort. IPv4-mapped IPv6 addresses come back as
+// IPv4, so the same connection always gives the same recentMarks key.
+func parseAddrPort(s string) (netip.AddrPort, error) {
+	ap, err := netip.ParseAddrPort(s)
 	if err != nil {
-		return nil, 0, fmt.Errorf("invalid port in %q: %w", s, err)
+		return netip.AddrPort{}, err
 	}
-	return ip, uint16(port), nil
+	return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()), nil
 }

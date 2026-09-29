@@ -406,29 +406,3 @@ func TestLiveSetMarkIPv6(t *testing.T) {
 	}
 	requireConntrackMark(t, srcAddr.IP, srcPort, dstAddr.IP, dstPort, 4748)
 }
-
-// TestLiveDiagnose checks what Diagnose reports for a live, tracked
-// connection, and for a client port with no connection behind it.
-func TestLiveDiagnose(t *testing.T) {
-	if os.Geteuid() != 0 {
-		t.Skip("skipping: must run as root with CAP_NET_ADMIN")
-	}
-	activateConntrack(t)
-
-	_, srcAddr, dstAddr := dialLoopback(t)
-	m := conntrack.NewMarker(nil)
-
-	d, err := m.Diagnose(srcAddr.IP, uint16(srcAddr.Port), uint16(dstAddr.Port))
-	skipIfPermissionDenied(t, err, "Diagnose")
-	if len(d.ClientSockets) != 1 || !d.Listening || len(d.ClientFlows) == 0 || d.ConntrackTotal == 0 || d.PeersOnPortCount != 1 {
-		t.Fatalf("unexpected diagnosis of a live connection: %+v", d)
-	}
-
-	d, err = m.Diagnose(srcAddr.IP, 1, uint16(dstAddr.Port))
-	if err != nil {
-		t.Fatalf("Diagnose: %v", err)
-	}
-	if len(d.ClientSockets) != 0 || !strings.Contains(d.Hint, "no TCP socket from this client IP:port, but conntrack") {
-		t.Fatalf("unexpected diagnosis of a port with no connection: %+v", d)
-	}
-}

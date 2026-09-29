@@ -2,7 +2,6 @@ package conntrack
 
 import (
 	"net"
-	"strings"
 	"testing"
 
 	"github.com/vishvananda/netlink"
@@ -99,25 +98,5 @@ func TestCandidateDstsMappedSource(t *testing.T) {
 	got := candidateDsts(net.ParseIP("::"), family, []net.IP{net.ParseIP("::1"), net.ParseIP("198.51.100.1")})
 	if len(got) != 1 || got[0].String() != "198.51.100.1" {
 		t.Fatalf("expected the IPv4 local address, got %v", got)
-	}
-}
-
-func TestHint(t *testing.T) {
-	cases := []struct {
-		name string
-		d    Diagnosis
-		want string
-	}{
-		{"empty table", Diagnosis{ConntrackTotal: 0, ClientSockets: []string{"x"}}, "table in this network namespace is empty"},
-		{"untracked", Diagnosis{ConntrackTotal: 10, ClientSockets: []string{"x"}, Listening: true}, "notrack"},
-		{"other tuple", Diagnosis{ConntrackTotal: 10, ClientSockets: []string{"x"}, ClientFlows: []string{"y"}, Listening: true}, "not with this tuple"},
-		{"wrong namespace", Diagnosis{ConntrackTotal: 10}, "not in Xray's namespace"},
-		{"flows but no socket", Diagnosis{ConntrackTotal: 10, Listening: true, ClientFlows: []string{"y"}}, "no TCP socket from this client IP:port, but conntrack"},
-		{"proxy in front", Diagnosis{ConntrackTotal: 10, Listening: true}, "not the TCP peer"},
-	}
-	for _, tc := range cases {
-		if got := hint(tc.d); !strings.Contains(got, tc.want) {
-			t.Errorf("%s: hint = %q, want it to contain %q", tc.name, got, tc.want)
-		}
 	}
 }

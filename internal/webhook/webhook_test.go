@@ -81,7 +81,7 @@ func post(t *testing.T, h http.Handler, body string) *httptest.ResponseRecorder 
 
 func TestHandlerMarksRealEvent(t *testing.T) {
 	marker := &fakeMarker{}
-	h := New(NewUsers(4), marker, nil, 0, nil)
+	h := New(NewUsers(4), marker, nil, 0, 0, nil)
 
 	body := `{
 		"email": "user-a",
@@ -98,8 +98,8 @@ func TestHandlerMarksRealEvent(t *testing.T) {
 		"ts": 1771886901
 	}`
 	rec := post(t, h, body)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d: %s", rec.Code, rec.Body.String())
 	}
 
 	marker.mu.Lock()
@@ -116,7 +116,7 @@ func TestHandlerMarksRealEvent(t *testing.T) {
 
 func TestHandlerStableMarkAcrossCalls(t *testing.T) {
 	marker := &fakeMarker{}
-	h := New(NewUsers(4), marker, nil, 0, nil)
+	h := New(NewUsers(4), marker, nil, 0, 0, nil)
 
 	body := `{"email":"user-a","network":"tcp","source":"1.1.1.1:1","inboundLocal":"2.2.2.2:2"}`
 	post(t, h, body)
@@ -150,7 +150,7 @@ func (f *fakeRateSetter) calls() int {
 func TestHandlerProvisionsRateOnlyOnce(t *testing.T) {
 	marker := &fakeMarker{}
 	rate := newFakeRateSetter()
-	h := New(NewUsers(4), marker, rate, 12_500_000, nil)
+	h := New(NewUsers(4), marker, rate, 12_500_000, 0, nil)
 
 	body := `{"email":"user-a","network":"tcp","source":"1.1.1.1:1","inboundLocal":"2.2.2.2:2"}`
 	post(t, h, body)
@@ -176,10 +176,10 @@ func TestHandlerRateSetterErrorStillMarks(t *testing.T) {
 	marker := &fakeMarker{}
 	rate := newFakeRateSetter()
 	rate.err = errors.New("tc failed")
-	h := New(NewUsers(4), marker, rate, 12_500_000, nil)
+	h := New(NewUsers(4), marker, rate, 12_500_000, 0, nil)
 
 	rec := post(t, h, `{"email":"user-a","source":"1.1.1.1:1","inboundLocal":"2.2.2.2:2"}`)
-	if rec.Code != http.StatusOK {
+	if rec.Code != http.StatusNoContent {
 		t.Fatalf("expected 200: a provisioning failure must not stop marking, got %d", rec.Code)
 	}
 	marker.mu.Lock()
@@ -205,7 +205,7 @@ func TestHandlerMarksWithoutWaitingForProvisioning(t *testing.T) {
 	marker := &fakeMarker{}
 	rate := &blockingRateSetter{release: make(chan struct{})}
 	defer close(rate.release)
-	h := New(NewUsers(4), marker, rate, 12_500_000, nil)
+	h := New(NewUsers(4), marker, rate, 12_500_000, 0, nil)
 
 	done := make(chan int, 2)
 	for _, email := range []string{"user-a", "user-b"} {
@@ -216,7 +216,7 @@ func TestHandlerMarksWithoutWaitingForProvisioning(t *testing.T) {
 	for range 2 {
 		select {
 		case code := <-done:
-			if code != http.StatusOK {
+			if code != http.StatusNoContent {
 				t.Fatalf("expected 200, got %d", code)
 			}
 		case <-time.After(2 * time.Second):
@@ -233,7 +233,7 @@ func TestHandlerMarksWithoutWaitingForProvisioning(t *testing.T) {
 func TestHandlerRetriesProvisioningAfterFailure(t *testing.T) {
 	rate := newFakeRateSetter()
 	rate.err = errors.New("tc failed")
-	h := New(NewUsers(4), &fakeMarker{}, rate, 12_500_000, nil)
+	h := New(NewUsers(4), &fakeMarker{}, rate, 12_500_000, 0, nil)
 
 	body := `{"email":"user-a","source":"1.1.1.1:1","inboundLocal":"2.2.2.2:2"}`
 	notQueued := func() bool { _, ok := h.queued.Load(userAMark); return !ok }
@@ -266,16 +266,16 @@ func TestHandlerRetriesProvisioningAfterFailure(t *testing.T) {
 
 func TestHandlerNilRateSetterSkipsProvisioning(t *testing.T) {
 	marker := &fakeMarker{}
-	h := New(NewUsers(4), marker, nil, 0, nil)
+	h := New(NewUsers(4), marker, nil, 0, 0, nil)
 
 	rec := post(t, h, `{"email":"user-a","source":"1.1.1.1:1","inboundLocal":"2.2.2.2:2"}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 with no rate setter configured, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 with no rate setter configured, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 
 func TestHandlerInvalidJSON(t *testing.T) {
-	h := New(NewUsers(4), &fakeMarker{}, nil, 0, nil)
+	h := New(NewUsers(4), &fakeMarker{}, nil, 0, 0, nil)
 	rec := post(t, h, `{not json`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", rec.Code)
@@ -284,7 +284,7 @@ func TestHandlerInvalidJSON(t *testing.T) {
 
 func TestHandlerMissingFieldsNoOp(t *testing.T) {
 	marker := &fakeMarker{}
-	h := New(NewUsers(4), marker, nil, 0, nil)
+	h := New(NewUsers(4), marker, nil, 0, 0, nil)
 
 	cases := []string{
 		`{}`,
@@ -310,7 +310,7 @@ func TestHandlerMissingFieldsNoOp(t *testing.T) {
 
 func TestHandlerMarkerError(t *testing.T) {
 	marker := &fakeMarker{err: errors.New("boom")}
-	h := New(NewUsers(4), marker, nil, 0, nil)
+	h := New(NewUsers(4), marker, nil, 0, 0, nil)
 
 	rec := post(t, h, `{"email":"user-a","source":"1.1.1.1:1","inboundLocal":"2.2.2.2:2"}`)
 	if rec.Code != http.StatusInternalServerError {
@@ -318,70 +318,35 @@ func TestHandlerMarkerError(t *testing.T) {
 	}
 }
 
-func TestParseHostPort(t *testing.T) {
+func TestParseAddrPort(t *testing.T) {
 	cases := []struct {
 		in      string
 		wantIP  string
 		wantErr bool
 	}{
 		{"203.0.113.7:54203", "203.0.113.7", false},
-		{"tcp:203.0.113.7:54203", "203.0.113.7", false},
 		{"[::1]:443", "::1", false},
+		{"[::]:443", "::", false},
+		{"[::ffff:203.0.113.7]:443", "203.0.113.7", false},
+		{"203.0.113.7:99999", "", true},
 		{"not-an-address", "", true},
 		{"", "", true},
 	}
 	for _, tc := range cases {
-		ip, port, err := parseHostPort(tc.in)
+		ap, err := parseAddrPort(tc.in)
 		if tc.wantErr {
 			if err == nil {
-				t.Errorf("parseHostPort(%q): expected error, got ip=%v port=%d", tc.in, ip, port)
+				t.Errorf("parseAddrPort(%q): expected error, got %v", tc.in, ap)
 			}
 			continue
 		}
 		if err != nil {
-			t.Errorf("parseHostPort(%q): unexpected error: %v", tc.in, err)
+			t.Errorf("parseAddrPort(%q): unexpected error: %v", tc.in, err)
 			continue
 		}
-		if ip.String() != tc.wantIP {
-			t.Errorf("parseHostPort(%q): ip = %v, want %v", tc.in, ip, tc.wantIP)
+		if ap.Addr().String() != tc.wantIP {
+			t.Errorf("parseAddrPort(%q): ip = %v, want %v", tc.in, ap.Addr(), tc.wantIP)
 		}
-	}
-}
-
-type diagnosingMarker struct {
-	fakeMarker
-	diagnosed chan struct{}
-}
-
-func (d *diagnosingMarker) DiagnoseMiss(net.IP, uint16, uint16) ([]any, error) {
-	d.diagnosed <- struct{}{}
-	return []any{"hint", "test"}, nil
-}
-
-func TestHandlerDiagnosesMissOncePerInterval(t *testing.T) {
-	marker := &diagnosingMarker{fakeMarker: fakeMarker{err: errors.New("boom")}, diagnosed: make(chan struct{}, 10)}
-	h := New(NewUsers(4), marker, nil, 0, nil)
-
-	for range 5 {
-		post(t, h, `{"email":"user-a","source":"1.1.1.1:1","inboundLocal":"2.2.2.2:2"}`)
-	}
-	select {
-	case <-marker.diagnosed:
-	case <-time.After(2 * time.Second):
-		t.Fatal("expected a diagnosis after a failed mark")
-	}
-	time.Sleep(50 * time.Millisecond)
-	if n := len(marker.diagnosed); n != 0 {
-		t.Fatalf("expected one diagnosis per interval, got %d more", n)
-	}
-
-	// Once the interval has passed, the next failure diagnoses again.
-	h.lastDiagnose.Add(-int64(missDiagnoseInterval))
-	post(t, h, `{"email":"user-a","source":"1.1.1.1:1","inboundLocal":"2.2.2.2:2"}`)
-	select {
-	case <-marker.diagnosed:
-	case <-time.After(2 * time.Second):
-		t.Fatal("expected another diagnosis once the interval passed")
 	}
 }
 
@@ -389,7 +354,7 @@ func TestHandlerQueueFullDoesNotBlock(t *testing.T) {
 	marker := &fakeMarker{}
 	rate := &blockingRateSetter{release: make(chan struct{})}
 	defer close(rate.release)
-	h := New(NewUsers(4), marker, rate, 12_500_000, nil)
+	h := New(NewUsers(4), marker, rate, 12_500_000, 0, nil)
 
 	// The worker takes one mark and blocks in Set; fill the rest of the
 	// queue, then one more webhook must still go through.
@@ -402,7 +367,7 @@ func TestHandlerQueueFullDoesNotBlock(t *testing.T) {
 	}()
 	select {
 	case code := <-done:
-		if code != http.StatusOK {
+		if code != http.StatusNoContent {
 			t.Fatalf("expected 200, got %d", code)
 		}
 	case <-time.After(2 * time.Second):
@@ -416,7 +381,7 @@ func TestHandlerQueueFullDoesNotBlock(t *testing.T) {
 func TestHandlerSkipsMarksThatHaveARate(t *testing.T) {
 	rate := newFakeRateSetter()
 	rate.rates[userAMark] = 1 // e.g. adopted at startup, or set through the API
-	h := New(NewUsers(4), &fakeMarker{}, rate, 12_500_000, nil)
+	h := New(NewUsers(4), &fakeMarker{}, rate, 12_500_000, 0, nil)
 
 	body := `{"email":"user-a","source":"1.1.1.1:1","inboundLocal":"2.2.2.2:2"}`
 	post(t, h, body)
@@ -430,4 +395,71 @@ func TestHandlerSkipsMarksThatHaveARate(t *testing.T) {
 	rate.Delete(userAMark)
 	post(t, h, body)
 	waitFor(t, "reprovisioning", func() bool { return rate.calls() == 1 })
+}
+
+func TestHandlerSkipsRecentlyMarkedConnection(t *testing.T) {
+	marker := &fakeMarker{}
+	h := New(NewUsers(4), marker, nil, 0, time.Minute, nil)
+	now := time.Unix(1_000_000, 0)
+	h.recent.now = func() time.Time { return now }
+
+	sameConn := `{"email":"user-a","source":"1.1.1.1:1","inboundLocal":"[::]:443"}`
+	otherConn := `{"email":"user-a","source":"1.1.1.1:2","inboundLocal":"[::]:443"}`
+	calls := func() int {
+		marker.mu.Lock()
+		defer marker.mu.Unlock()
+		return len(marker.calls)
+	}
+
+	for range 3 {
+		if rec := post(t, h, sameConn); rec.Code != http.StatusNoContent {
+			t.Fatalf("expected 204, got %d", rec.Code)
+		}
+	}
+	if calls() != 1 {
+		t.Fatalf("SetMark called %d times for one connection within the window, want 1", calls())
+	}
+	post(t, h, otherConn)
+	if calls() != 2 {
+		t.Fatalf("another connection must be marked, got %d calls", calls())
+	}
+
+	now = now.Add(time.Minute)
+	post(t, h, sameConn)
+	if calls() != 3 {
+		t.Fatalf("after the window the connection must be marked again, got %d calls", calls())
+	}
+}
+
+func TestHandlerRetriesConnectionAfterFailedMark(t *testing.T) {
+	marker := &fakeMarker{err: errors.New("no conntrack entry")}
+	h := New(NewUsers(4), marker, nil, 0, time.Minute, nil)
+
+	body := `{"email":"user-a","source":"1.1.1.1:1","inboundLocal":"[::]:443"}`
+	post(t, h, body)
+	marker.mu.Lock()
+	marker.err = nil
+	marker.mu.Unlock()
+	if rec := post(t, h, body); rec.Code != http.StatusNoContent {
+		t.Fatalf("expected the retry to mark the connection, got %d", rec.Code)
+	}
+	marker.mu.Lock()
+	defer marker.mu.Unlock()
+	if len(marker.calls) != 2 {
+		t.Fatalf("a failed mark must not be remembered, got %d SetMark calls", len(marker.calls))
+	}
+}
+
+func TestRecentMarksSweepsExpired(t *testing.T) {
+	r := newRecentMarks(time.Minute)
+	now := time.Unix(1_000_000, 0)
+	r.now = func() time.Time { return now }
+
+	old := markedConn{mark: 1}
+	r.add(old)
+	now = now.Add(2 * time.Minute)
+	r.add(markedConn{mark: 2})
+	if _, ok := r.marked[old]; ok || len(r.marked) != 1 {
+		t.Fatalf("expired entry not swept: %v", r.marked)
+	}
 }
