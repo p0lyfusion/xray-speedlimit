@@ -53,6 +53,11 @@ func (f *fakeBaseStore) Delete(mark uint32) error {
 	return nil
 }
 
+func (f *fakeBaseStore) Get(mark uint32) (uint32, bool) {
+	rate, ok := f.entries[mark]
+	return rate, ok
+}
+
 func (f *fakeBaseStore) List() ([]limiter.Entry, error) {
 	entries := make([]limiter.Entry, 0, len(f.entries))
 	for mark, rate := range f.entries {

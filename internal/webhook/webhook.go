@@ -17,6 +17,10 @@ import (
 // connection the Marker couldn't mark. Each one dumps kernel tables.
 const missDiagnoseInterval = 30 * time.Second
 
+// provisionQueueSize bounds how many marks can wait for provisioning. A
+// mark that doesn't fit is queued again by its next webhook.
+const provisionQueueSize = 16384
+
 // Marker marks a live connection so downstream enforcement (e.g. tc/HTB)
 // can act on it. Handler passes dstIP straight through from Xray-core's
 // InboundLocal (see parseHostPort below), which is unreliable for some
@@ -38,11 +42,13 @@ type MissDiagnoser interface {
 }
 
 // RateSetter applies a bandwidth cap to a mark (e.g. by creating/updating
-// its tc/HTB class). limiter.Store satisfies this. Handler calls it once
-// per mark, from a background worker, not on every webhook, since
-// implementations reconfigure real kernel state on each call.
+// its tc/HTB class) and reports which marks already have one.
+// limiter.Store satisfies this. Handler calls Get on every webhook, so it
+// must not wait on the kernel, and Set only for marks with no rate, from
+// a background worker.
 type RateSetter interface {
 	Set(mark uint32, rateBytesPerSec uint32) error
+	Get(mark uint32) (rateBytesPerSec uint32, ok bool)
 }
 
 // event mirrors the subset of xray-core's app/router webhook payload
@@ -58,20 +64,16 @@ type event struct {
 // Handler receives xray-core webhook POSTs and applies a conntrack mark
 // to the client connection they describe.
 type Handler struct {
-	alloc                  *Allocator
+	users                  *Users
 	marker                 Marker
 	rate                   RateSetter
 	perUserRateBytesPerSec uint32
 	log                    *slog.Logger
 
-	// provisioned records marks whose rate.Set has succeeded (mark ->
-	// struct{}).
-	provisioned sync.Map
 	// queued records marks waiting in provisionQueue (mark -> struct{}),
 	// so a mark is queued at most once at a time.
 	queued sync.Map
-	// provisionQueue feeds provisionLoop. It holds one slot per mark the
-	// allocator can hand out, so a send never blocks.
+	// provisionQueue feeds provisionLoop.
 	provisionQueue chan uint32
 
 	// lastDiagnose is when the last miss diagnosis started, in Unix
@@ -79,49 +81,47 @@ type Handler struct {
 	lastDiagnose atomic.Int64
 }
 
-// New creates a webhook Handler. If rate is non-nil, every newly
-// allocated mark is provisioned with a perUserRateBytesPerSec cap via
+// New creates a webhook Handler. If rate is non-nil, every mark seen that
+// has no rate yet is provisioned with a perUserRateBytesPerSec cap via
 // rate.Set, so per-user limits apply uniformly without any external
 // provisioning step. Pass a nil rate to manage rates by hand instead
 // (e.g. via the HTTP API).
-func New(alloc *Allocator, marker Marker, rate RateSetter, perUserRateBytesPerSec uint32, log *slog.Logger) *Handler {
+func New(users *Users, marker Marker, rate RateSetter, perUserRateBytesPerSec uint32, log *slog.Logger) *Handler {
 	if log == nil {
 		log = slog.Default()
 	}
 	h := &Handler{
-		alloc:                  alloc,
+		users:                  users,
 		marker:                 marker,
 		rate:                   rate,
 		perUserRateBytesPerSec: perUserRateBytesPerSec,
 		log:                    log,
 	}
 	if rate != nil {
-		h.provisionQueue = make(chan uint32, alloc.count)
+		h.provisionQueue = make(chan uint32, provisionQueueSize)
 		go h.provisionLoop()
 	}
 	return h
 }
 
-// queueProvision hands mark to provisionLoop unless its rate is already
-// set or it is already waiting. Provisioning runs in the background
-// because it can be slow: rate.Set shells out to tc, which takes tens of
-// milliseconds per call on a host with thousands of classes. After a
-// restart every active user is new again, and when webhooks waited for
-// that in turn, they reached SetMark minutes late, after short
-// connections had closed. Until its class exists, a marked flow rides
-// the default class.
-//
-// This is called on every webhook for the mark, so a mark whose rate.Set
-// failed is queued again by its next webhook: the allocator's isNew
-// fires only once, whether or not provisioning then succeeds.
+// queueProvision hands mark to provisionLoop unless it already has a rate
+// or is already waiting. Provisioning runs in the background, and the
+// send never blocks, because tc is slow and marking must not wait for it.
+// A mark whose Set failed, or that didn't fit in the queue, is queued
+// again by its next webhook. Until its class exists, a marked flow rides
+// its queue's default class.
 func (h *Handler) queueProvision(mark uint32) {
-	if _, ok := h.provisioned.Load(mark); ok {
+	if _, ok := h.rate.Get(mark); ok {
 		return
 	}
 	if _, loaded := h.queued.LoadOrStore(mark, struct{}{}); loaded {
 		return
 	}
-	h.provisionQueue <- mark
+	select {
+	case h.provisionQueue <- mark:
+	default:
+		h.queued.Delete(mark)
+	}
 }
 
 // provisionLoop applies the per-user rate to each queued mark, one at a
@@ -130,8 +130,6 @@ func (h *Handler) provisionLoop() {
 	for mark := range h.provisionQueue {
 		if err := h.rate.Set(mark, h.perUserRateBytesPerSec); err != nil {
 			h.log.Error("webhook: failed to provision per-user rate", "mark", mark, "error", err)
-		} else {
-			h.provisioned.Store(mark, struct{}{})
 		}
 		h.queued.Delete(mark)
 	}
@@ -166,7 +164,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mark, _ := h.alloc.Allocate(*ev.Email)
+	mark := h.users.Mark(*ev.Email)
 	if mark == 0 {
 		w.WriteHeader(http.StatusNoContent)
 		return

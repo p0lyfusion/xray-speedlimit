@@ -14,4 +14,6 @@ type Store interface {
 	Set(mark uint32, rateBytesPerSec uint32) error
 	Delete(mark uint32) error
 	List() ([]Entry, error)
+	// Get returns mark's rate, and whether it has one.
+	Get(mark uint32) (rateBytesPerSec uint32, ok bool)
 }

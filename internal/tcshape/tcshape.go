@@ -1,27 +1,49 @@
-// Package tcshape enforces per-mark bandwidth limits with a Linux HTB
-// qdisc, classifying packets by the firewall mark that internal/conntrack
-// restores onto them. It only shapes egress (server -> client) traffic;
-// see the README for why ingress shaping was left out.
+// Package tcshape enforces per-mark bandwidth limits with one HTB qdisc
+// per TX queue, classifying packets by the firewall mark that
+// internal/conntrack restores onto them. It only shapes egress (server ->
+// client) traffic; see the README for why ingress shaping was left out.
+//
+// The layout on the interface is:
+//
+//	root mq 8000:
+//	  8000:<q> -> htb <q>: default 1     one per TX queue q = 1..queues
+//	                class <q>:1           default class, link rate
+//	                class <q>:<minor>     one per user (see internal/mark)
+//	                filter fw             no entries: classid = skb mark
+//	clsact egress
+//	  fw mark <q><<16/0xff0000 -> skbedit queue_mapping <q-1>
+//
+// Each queue's HTB has its own lock, so shaping scales across CPUs instead
+// of serializing every packet on one root qdisc. A mark (q<<16 | minor) is
+// steered onto TX queue q-1 by the clsact filter, and the filter-less fw
+// classifier in htb q: then uses the mark itself as the classid q:minor.
+// Traffic with no mark keeps the queue the kernel picks and lands in that
+// queue's default class.
 package tcshape
 
 import (
+	"encoding/json"
 	"fmt"
+	"math"
 	"os/exec"
+	"slices"
+	"strconv"
 	"strings"
+
+	"github.com/p0lyfusion/xray-speedlimit/internal/mark"
 )
 
 const (
-	// MinMark and MaxMark bound the marks a Shaper accepts. Mark 0 means
-	// "no mark", mark 1 would encode to defaultClassID (see classIDFor),
-	// and the HTB classid minor is a 16-bit field.
-	MinMark = 2
-	MaxMark = 0xffff
+	// mqHandle is the root mq qdisc's handle. Its classes are
+	// 8000:1..8000:<num_tx_queues>, one per TX queue.
+	mqHandle = "8000:"
 
-	// defaultClassID is the catch-all bucket for traffic with no fw
-	// filter match. It is what classIDFor would return for mark 1, which
-	// is why MinMark is 2.
-	defaultClassID = "1:1"
-	nftTable       = "xray_speedlimit"
+	// steerPref is the tc filter priority of this package's clsact
+	// egress steering filters. A dedicated priority lets them be replaced
+	// without touching filters other tools keep on the same clsact.
+	steerPref = "49000"
+
+	nftTable = "xray_speedlimit"
 
 	// minHTBBurstBytes floors the computed burst/cburst size so a very
 	// low class rate (or a short burstMs) can't round down to a value tc
@@ -29,53 +51,44 @@ const (
 	minHTBBurstBytes = 2048
 )
 
-// classIDFor renders mark as an HTB classid. tc parses "major:minor" as
-// hexadecimal and the minor part is a 16-bit kernel field (TC_H_MIN), so
-// mark must fit in 16 bits and is formatted in hex to make the classid's
-// numeric value equal to mark itself, matching the decimal fw filter
-// handle (see SetRate) that is compared against the real (undecorated)
-// skb mark.
-func classIDFor(mark uint32) (string, error) {
-	if mark < MinMark || mark > MaxMark {
-		return "", fmt.Errorf("mark %d is out of the usable HTB classid range (%d-%d; 1:1 is the default class)", mark, MinMark, MaxMark)
-	}
-	return fmt.Sprintf("1:%x", mark), nil
-}
-
-// fwFilters lists the tc protocol and prio of each fw filter SetRate
-// installs per mark. IPv4 and IPv6 need a filter each, because a tc
-// filter only sees packets of its own protocol. They sit at different
-// prios because the kernel refuses to mix protocols within one prio, and
-// prio 1 already holds protocol ip filters on existing installs.
-var fwFilters = []struct{ protocol, prio string }{
-	{"ip", "1"},
-	{"ipv6", "2"},
-}
-
-// fwFilterArgs builds a "tc filter <verb>" command line for mark's fw
-// filter of the given protocol/prio.
-func (s *Shaper) fwFilterArgs(verb, protocol, prio string, mark uint32, classID string) []string {
-	return []string{"filter", verb, "dev", s.iface, "parent", "1:", "protocol", protocol, "prio", prio, "handle", fmt.Sprintf("%d", mark), "fw", "flowid", classID}
-}
-
-// Shaper manages an HTB qdisc and one class+filter pair per mark on a
+// Shaper manages the per-queue HTB layout and one class per mark on a
 // single network interface.
 type Shaper struct {
-	iface           string
-	defaultRateMbit uint64
-	burstMs         uint64
+	iface   string
+	queues  int
+	burstMs uint64
 }
 
-// New creates a Shaper for the given interface. defaultRateMbit sets the
-// rate of the default/unclassified-traffic HTB class; see the
-// README for why it must reflect the interface's real link capacity.
-// burstMs sets every class's burst/cburst allowance to that many
-// milliseconds' worth of bytes at the class's own rate (0 leaves it at
-// the kernel's own default sizing, which is normally just a couple KB —
-// enough to smoothly pace traffic, not enough to avoid throttling short
-// bursts like a page load or TCP slow start).
-func New(iface string, defaultRateMbit, burstMs uint64) *Shaper {
-	return &Shaper{iface: iface, defaultRateMbit: defaultRateMbit, burstMs: burstMs}
+// New creates a Shaper for iface, which has queues TX queues in use
+// (1..mark.MaxQueues). burstMs sets every class's burst/cburst allowance to
+// that many milliseconds' worth of bytes at the class's own rate (0 leaves
+// it at the kernel's own default sizing, which is normally just a couple
+// KB — enough to smoothly pace traffic, not enough to avoid throttling
+// short bursts like a page load or TCP slow start).
+func New(iface string, queues int, burstMs uint64) *Shaper {
+	return &Shaper{iface: iface, queues: queues, burstMs: burstMs}
+}
+
+// htbHandle is the handle of queue major's HTB qdisc.
+func htbHandle(major uint32) string {
+	return fmt.Sprintf("%x:", major)
+}
+
+// mqClass is the mq class (TX queue major-1) queue major's HTB hangs off.
+func mqClass(major uint32) string {
+	return fmt.Sprintf("%s%x", mqHandle, major)
+}
+
+// classIDFor renders mark as its HTB classid, major:minor in hex as tc
+// expects, and returns the major too. The classid's numeric value equals
+// the mark, which is what lets the filter-less fw classifier map a mark
+// straight to its class.
+func (s *Shaper) classIDFor(m uint32) (classID string, major uint32, err error) {
+	major, minor, ok := mark.Split(m, s.queues)
+	if !ok {
+		return "", 0, fmt.Errorf("mark %#x is not a user mark for %d queues (want (queue 1-%d)<<16 | minor %d-65535)", m, s.queues, s.queues, mark.MinMinor)
+	}
+	return fmt.Sprintf("%x:%x", major, minor), major, nil
 }
 
 // htbBurstBytes returns the burst/cburst size, in bytes, for burstMs
@@ -100,47 +113,289 @@ func htbRateArgs(rateBytesPerSec, burstMs uint64) []string {
 }
 
 // classArgs builds a full "tc class <verb> ... classid <classID> htb rate
-// ..." command line for this shaper's interface.
-func (s *Shaper) classArgs(verb, classID string, rateBytesPerSec uint64) []string {
-	return append([]string{"class", verb, "dev", s.iface, "parent", "1:", "classid", classID},
+// ..." command line for a class under HTB major.
+func (s *Shaper) classArgs(verb string, major uint32, classID string, rateBytesPerSec uint64) []string {
+	return append([]string{"class", verb, "dev", s.iface, "parent", htbHandle(major), "classid", classID},
 		htbRateArgs(rateBytesPerSec, s.burstMs)...)
 }
 
-// RootQdiscExists reports whether iface already has this package's root
-// HTB qdisc, e.g. from an earlier run.
-func RootQdiscExists(iface string) (bool, error) {
-	out, err := runOutput("tc", "qdisc", "show", "dev", iface)
+// tcQdisc is one entry of "tc -j qdisc show".
+type tcQdisc struct {
+	Kind   string `json:"kind"`
+	Handle string `json:"handle"`
+	Parent string `json:"parent"`
+	Root   bool   `json:"root"`
+}
+
+// LayoutExists reports whether iface already has this package's layout
+// for exactly this many queues, e.g. from an earlier run. A layout for a
+// different queue count (the queue count was changed with ethtool -L)
+// doesn't count: every mark depends on the queue count, so it has to be
+// rebuilt.
+func (s *Shaper) LayoutExists() (bool, error) {
+	qdiscs, err := s.qdiscs()
 	if err != nil {
 		return false, err
 	}
-	return strings.Contains(string(out), "htb 1:"), nil
+	return layoutMatches(qdiscs, s.queues), nil
 }
 
-// EnsureRoot creates the root HTB qdisc and its default class if they are
-// not already present, and (re)installs the conntrack mark restore rule
-// either way. rootExists should come from a fresh
-// RootQdiscExists(s.iface) call — callers that already needed that answer
-// for another reason (e.g. deciding whether to auto-detect a rate) pass
-// it straight through instead of this re-querying it.
-//
-// The nft rule is not tied to rootExists: the qdisc can outlive it (an
-// earlier start that failed at the nft step, or an nftables service
-// reload that flushed the ruleset), and without it nothing is shaped.
-func (s *Shaper) EnsureRoot(rootExists bool) error {
-	if !rootExists {
-		if err := run("tc", "qdisc", "add", "dev", s.iface, "root", "handle", "1:", "htb", "default", "1"); err != nil {
-			return fmt.Errorf("creating root htb qdisc on %s: %w", s.iface, err)
-		}
-		defaultRateBps := s.defaultRateMbit * 1_000_000 / 8
-		if err := run("tc", s.classArgs("add", defaultClassID, defaultRateBps)...); err != nil {
-			return fmt.Errorf("creating default htb class on %s: %w", s.iface, err)
+func (s *Shaper) qdiscs() ([]tcQdisc, error) {
+	out, err := runJSON("tc", "-j", "qdisc", "show", "dev", s.iface)
+	if err != nil {
+		return nil, err
+	}
+	var qdiscs []tcQdisc
+	if err := json.Unmarshal(out, &qdiscs); err != nil {
+		return nil, fmt.Errorf("parsing tc qdisc output: %w", err)
+	}
+	return qdiscs, nil
+}
+
+// layoutMatches reports whether qdiscs are an mq root with an HTB child
+// on each of the first queues TX queues and no HTB on any other.
+func layoutMatches(qdiscs []tcQdisc, queues int) bool {
+	rootOK := false
+	htbs := 0
+	for _, q := range qdiscs {
+		switch {
+		case q.Root && q.Kind == "mq" && q.Handle == mqHandle:
+			rootOK = true
+		case q.Kind == "htb":
+			major, err := strconv.ParseUint(strings.TrimSuffix(q.Handle, ":"), 16, 32)
+			if err != nil || major < 1 || major > uint64(queues) || q.Parent != mqClass(uint32(major)) {
+				return false
+			}
+			htbs++
 		}
 	}
+	return rootOK && htbs == queues
+}
 
+// EnsureRoot builds the layout unless layoutExists (from a fresh
+// LayoutExists call) says it is already there, then (re)installs the
+// steering filters and the conntrack mark restore rule.
+// defaultRateMbit is the rate of each queue's default class, and is only
+// used when building; see the README for why it must reflect the
+// interface's real link capacity.
+//
+// Building replaces the root qdisc, which drops whatever tree was there
+// before, including a single-HTB layout from older versions, along with
+// every per-user class. Flows marked under an older layout carry marks
+// no class matches, so they ride their queue's default class until a
+// webhook re-marks them.
+//
+// The steering filters and the nft rule are not tied to layoutExists:
+// the qdisc can outlive either (a clsact removed by another tool, an
+// nftables service reload that flushed the ruleset), and without them
+// nothing is shaped.
+func (s *Shaper) EnsureRoot(layoutExists bool, defaultRateMbit uint64) error {
+	if !layoutExists {
+		if err := s.buildLayout(defaultRateMbit); err != nil {
+			return err
+		}
+	}
+	if err := s.ensureSteering(); err != nil {
+		return err
+	}
 	if err := ensureConnmarkRestore(); err != nil {
 		return fmt.Errorf("setting up conntrack mark restore: %w", err)
 	}
 	return nil
+}
+
+func (s *Shaper) buildLayout(defaultRateMbit uint64) error {
+	// Delete and add rather than replace: replacing an mq 8000: root with
+	// another one only changes it in place, keeping its old HTB children,
+	// and then adding them again fails. Deleting fails harmlessly when
+	// the device still has its default root qdisc; any real problem shows
+	// up in the add.
+	_ = exec.Command("tc", "qdisc", "del", "dev", s.iface, "root").Run()
+	if err := run("tc", "qdisc", "add", "dev", s.iface, "root", "handle", mqHandle, "mq"); err != nil {
+		return fmt.Errorf("creating root mq qdisc on %s: %w", s.iface, err)
+	}
+	defaultRateBps := defaultRateMbit * 1_000_000 / 8
+	for q := uint32(1); q <= uint32(s.queues); q++ {
+		handle := htbHandle(q)
+		if err := run("tc", "qdisc", "add", "dev", s.iface, "parent", mqClass(q), "handle", handle, "htb", "default", "1"); err != nil {
+			return fmt.Errorf("creating htb qdisc for TX queue %d on %s: %w", q-1, s.iface, err)
+		}
+		if err := run("tc", s.classArgs("add", q, handle+"1", defaultRateBps)...); err != nil {
+			return fmt.Errorf("creating default htb class for TX queue %d on %s: %w", q-1, s.iface, err)
+		}
+		// A fw filter with no entries uses the skb mark itself as the
+		// classid, for marks whose major is this qdisc's handle.
+		if err := run("tc", "filter", "add", "dev", s.iface, "parent", handle, "protocol", "all", "prio", "1", "fw"); err != nil {
+			return fmt.Errorf("creating fw classifier for TX queue %d on %s: %w", q-1, s.iface, err)
+		}
+	}
+	return nil
+}
+
+// tcFilter is one entry of "tc -j filter show".
+type tcFilter struct {
+	Kind    string `json:"kind"`
+	Pref    int    `json:"pref"`
+	Options *struct {
+		Fw *struct {
+			Mark string `json:"mark"`
+			Mask string `json:"mask"`
+		} `json:"fw"`
+		Actions []struct {
+			Kind         string `json:"kind"`
+			QueueMapping *int   `json:"queue_mapping"`
+		} `json:"actions"`
+	} `json:"options"`
+}
+
+// ensureSteering makes sure clsact egress holds exactly one steering
+// filter per queue at steerPref, rebuilding the set if it doesn't.
+func (s *Shaper) ensureSteering() error {
+	qdiscs, err := s.qdiscs()
+	if err != nil {
+		return err
+	}
+	if !slices.ContainsFunc(qdiscs, func(q tcQdisc) bool { return q.Kind == "clsact" }) {
+		if err := run("tc", "qdisc", "add", "dev", s.iface, "clsact"); err != nil {
+			return fmt.Errorf("creating clsact qdisc on %s: %w", s.iface, err)
+		}
+	} else {
+		out, err := runJSON("tc", "-j", "filter", "show", "dev", s.iface, "egress", "pref", steerPref)
+		if err != nil {
+			return err
+		}
+		var filters []tcFilter
+		if err := json.Unmarshal(out, &filters); err != nil {
+			return fmt.Errorf("parsing tc filter output: %w", err)
+		}
+		if steeringMatches(filters, s.queues) {
+			return nil
+		}
+		// Deleting by priority removes only this package's filters.
+		if len(filters) > 0 {
+			if err := run("tc", "filter", "del", "dev", s.iface, "egress", "pref", steerPref); err != nil {
+				return fmt.Errorf("removing old steering filters on %s: %w", s.iface, err)
+			}
+		}
+	}
+
+	for q := uint32(1); q <= uint32(s.queues); q++ {
+		if err := run("tc", "filter", "add", "dev", s.iface, "egress", "protocol", "all", "pref", steerPref,
+			"handle", fmt.Sprintf("%#x/%#x", mark.Join(q, 0), mark.QueueMask), "fw",
+			"action", "skbedit", "queue_mapping", strconv.Itoa(int(q-1))); err != nil {
+			return fmt.Errorf("creating steering filter for TX queue %d on %s: %w", q-1, s.iface, err)
+		}
+	}
+	return nil
+}
+
+// steeringMatches reports whether filters (all at steerPref) steer each
+// of queues queue fields to its TX queue and do nothing else.
+func steeringMatches(filters []tcFilter, queues int) bool {
+	seen := make(map[int]bool)
+	for _, f := range filters {
+		if f.Options == nil {
+			continue // the classifier's own header entry
+		}
+		if f.Kind != "fw" || f.Options.Fw == nil || len(f.Options.Actions) != 1 {
+			return false
+		}
+		markVal, err1 := strconv.ParseUint(f.Options.Fw.Mark, 0, 32)
+		mask, err2 := strconv.ParseUint(f.Options.Fw.Mask, 0, 32)
+		a := f.Options.Actions[0]
+		if err1 != nil || err2 != nil || mask != mark.QueueMask || markVal&^mark.QueueMask != 0 ||
+			a.Kind != "skbedit" || a.QueueMapping == nil {
+			return false
+		}
+		q := int(markVal >> 16)
+		if q < 1 || q > queues || *a.QueueMapping != q-1 || seen[q] {
+			return false
+		}
+		seen[q] = true
+	}
+	return len(seen) == queues
+}
+
+// SetRate creates or updates mark's class with the given rate.
+func (s *Shaper) SetRate(m uint32, rateBytesPerSec uint32) error {
+	classID, major, err := s.classIDFor(m)
+	if err != nil {
+		return err
+	}
+	if err := run("tc", s.classArgs("replace", major, classID, uint64(rateBytesPerSec))...); err != nil {
+		return fmt.Errorf("setting htb rate for mark %#x on %s: %w", m, s.iface, err)
+	}
+	return nil
+}
+
+// Remove deletes mark's class. A value that isn't a user mark is a no-op:
+// SetRate never creates anything for it, and minor 1 would otherwise name
+// a queue's default class.
+func (s *Shaper) Remove(m uint32) error {
+	classID, _, err := s.classIDFor(m)
+	if err != nil {
+		return nil
+	}
+	out, err := exec.Command("tc", "class", "del", "dev", s.iface, "classid", classID).CombinedOutput()
+	if err != nil && !strings.Contains(string(out), "No such file or directory") {
+		return fmt.Errorf("removing htb class for mark %#x on %s: %w: %s", m, s.iface, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// Class is a per-user class found on the interface.
+type Class struct {
+	Mark            uint32
+	RateBytesPerSec uint32
+	// Bytes is how many bytes the class has sent since it was created.
+	Bytes uint64
+}
+
+// tcClass is one entry of "tc -j -s class show".
+type tcClass struct {
+	Class  string `json:"class"`
+	Handle string `json:"handle"`
+	Rate   uint64 `json:"rate"`
+	Stats  struct {
+		Bytes uint64 `json:"bytes"`
+	} `json:"stats"`
+}
+
+// Classes lists every per-user class on the interface, in one tc call.
+func (s *Shaper) Classes() ([]Class, error) {
+	out, err := runJSON("tc", "-j", "-s", "class", "show", "dev", s.iface)
+	if err != nil {
+		return nil, err
+	}
+	return parseClasses(out, s.queues)
+}
+
+func parseClasses(out []byte, queues int) ([]Class, error) {
+	var raw []tcClass
+	if err := json.Unmarshal(out, &raw); err != nil {
+		return nil, fmt.Errorf("parsing tc class output: %w", err)
+	}
+	var classes []Class
+	for _, c := range raw {
+		if c.Class != "htb" {
+			continue
+		}
+		majorStr, minorStr, ok := strings.Cut(c.Handle, ":")
+		if !ok {
+			continue
+		}
+		major, err1 := strconv.ParseUint(majorStr, 16, 16)
+		minor, err2 := strconv.ParseUint(minorStr, 16, 16)
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		m := mark.Join(uint32(major), uint32(minor))
+		if _, _, ok := mark.Split(m, queues); !ok {
+			continue // a default class, or not ours
+		}
+		classes = append(classes, Class{Mark: m, RateBytesPerSec: uint32(min(c.Rate, math.MaxUint32)), Bytes: c.Stats.Bytes})
+	}
+	return classes, nil
 }
 
 // connmarkRestoreRuleset recreates this package's nft table in a single
@@ -165,9 +420,9 @@ table inet %[1]s {
 
 // ensureConnmarkRestore installs an nftables rule that copies the
 // conntrack mark onto the packet mark on the way out, which is what lets
-// the "fw" tc filters classify by it. As a side effect, having any
-// conntrack-aware rule loaded is also what makes the kernel track
-// connections in this network namespace in the first place.
+// the steering filters and fw classifiers act on it. As a side effect,
+// having any conntrack-aware rule loaded is also what makes the kernel
+// track connections in this network namespace in the first place.
 func ensureConnmarkRestore() error {
 	cmd := exec.Command("nft", "-f", "-")
 	cmd.Stdin = strings.NewReader(connmarkRestoreRuleset)
@@ -177,55 +432,24 @@ func ensureConnmarkRestore() error {
 	return nil
 }
 
-// SetRate creates or updates the HTB class and fw filters for mark.
-func (s *Shaper) SetRate(mark uint32, rateBytesPerSec uint32) error {
-	classID, err := classIDFor(mark)
+// runJSON runs a tc command whose stdout is JSON, returning stdout alone:
+// tc can print warnings to stderr even when it succeeds.
+func runJSON(name string, args ...string) ([]byte, error) {
+	var stderr strings.Builder
+	cmd := exec.Command(name, args...)
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
 	if err != nil {
-		return err
-	}
-	if err := run("tc", s.classArgs("replace", classID, uint64(rateBytesPerSec))...); err != nil {
-		return fmt.Errorf("setting htb rate for mark %d on %s: %w", mark, s.iface, err)
-	}
-
-	for _, f := range fwFilters {
-		if err := run("tc", s.fwFilterArgs("replace", f.protocol, f.prio, mark, classID)...); err != nil {
-			return fmt.Errorf("setting %s fw filter for mark %d on %s: %w", f.protocol, mark, s.iface, err)
-		}
-	}
-	return nil
-}
-
-// Remove deletes the fw filters and HTB class for mark. A mark outside
-// [MinMark, MaxMark] is a no-op: SetRate never creates anything for it,
-// and mark 1 would otherwise name the default class.
-func (s *Shaper) Remove(mark uint32) error {
-	classID, err := classIDFor(mark)
-	if err != nil {
-		return nil
-	}
-
-	for _, f := range fwFilters {
-		_ = run("tc", s.fwFilterArgs("del", f.protocol, f.prio, mark, classID)...)
-	}
-
-	out, err := exec.Command("tc", "class", "del", "dev", s.iface, "parent", "1:", "classid", classID).CombinedOutput()
-	if err != nil && !strings.Contains(string(out), "No such file or directory") {
-		return fmt.Errorf("removing htb class for mark %d on %s: %w: %s", mark, s.iface, err, strings.TrimSpace(string(out)))
-	}
-	return nil
-}
-
-// runOutput runs an external command, returning its combined output on
-// success and a wrapped error (with output attached) on failure.
-func runOutput(name string, args ...string) ([]byte, error) {
-	out, err := exec.Command(name, args...).CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		return nil, fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
 	return out, nil
 }
 
+// run runs an external command and returns a wrapped error (with output
+// attached) on failure.
 func run(name string, args ...string) error {
-	_, err := runOutput(name, args...)
-	return err
+	if out, err := exec.Command(name, args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }

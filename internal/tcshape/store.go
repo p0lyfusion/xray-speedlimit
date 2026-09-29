@@ -36,7 +36,7 @@ func WrapStore(base limiter.Store, shaper RateShaper, log *slog.Logger) limiter.
 }
 
 // Set applies the rate in tc first and only records it in base once that
-// succeeds, so a tc failure (e.g. a mark outside the 16-bit classid range)
+// succeeds, so a tc failure (e.g. a mark no user can have)
 // never shows up in List as a limit that isn't actually enforced.
 func (s *shapedStore) Set(mark uint32, rate uint32) error {
 	s.mu.Lock()
@@ -58,6 +58,12 @@ func (s *shapedStore) Delete(mark uint32) error {
 		return err
 	}
 	return s.base.Delete(mark)
+}
+
+// Get reads base without taking mu, so a caller on the webhook path never
+// waits behind a Set or Delete that is running tc.
+func (s *shapedStore) Get(mark uint32) (uint32, bool) {
+	return s.base.Get(mark)
 }
 
 func (s *shapedStore) List() ([]limiter.Entry, error) {

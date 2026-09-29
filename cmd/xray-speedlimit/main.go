@@ -11,14 +11,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/p0lyfusion/xray-speedlimit/internal/api"
 	"github.com/p0lyfusion/xray-speedlimit/internal/conntrack"
 	"github.com/p0lyfusion/xray-speedlimit/internal/limiter"
+	"github.com/p0lyfusion/xray-speedlimit/internal/mark"
 	"github.com/p0lyfusion/xray-speedlimit/internal/netif"
 	"github.com/p0lyfusion/xray-speedlimit/internal/tcshape"
 	"github.com/p0lyfusion/xray-speedlimit/internal/webhook"
@@ -34,22 +33,26 @@ type config struct {
 	addr                 string
 	webhookAddr          string
 	iface                string
-	marks                markRange
+	txQueues             int
+	markRange            string
 	defaultClassRateMbit uint64
 	htbBurstMs           uint64
 	perUserRateMbit      uint64
+	classIdleTimeout     time.Duration
 }
 
 func main() {
-	cfg := config{marks: markRange{first: 20000, last: 39999}}
+	var cfg config
 
 	flag.StringVar(&cfg.addr, "addr", ":7070", "HTTP API listen address")
 	flag.StringVar(&cfg.webhookAddr, "webhook-addr", "@xray-speedlimit-webhook", "listen address for the Xray webhook receiver, separate from -addr since this is hit on every new connection: host:port, a filesystem Unix socket path, or a Linux abstract socket (@name, or @@name padded for HAProxy compatibility) — abstract is the default and fastest, and needs no bind mount across a --network host container boundary")
 	flag.StringVar(&cfg.iface, "iface", "", "network interface for tc/HTB shaping (default: the interface used by the default route)")
-	flag.Var(&cfg.marks, "mark-range", "inclusive range of marks handed out to users, as first-last; must lie within 2-65535 (the HTB classid limit, and 1:1 is the default class)")
+	flag.IntVar(&cfg.txQueues, "tx-queues", 0, "number of TX queues to spread users over, one HTB qdisc each (at most 255); 0 = every TX queue -iface has in use. Every user's mark depends on it")
+	flag.StringVar(&cfg.markRange, "mark-range", "", "no longer used: marks are computed from the email (see -tx-queues); accepted and ignored so older configs keep working")
 	flag.Uint64Var(&cfg.defaultClassRateMbit, "default-class-rate-mbit", 0, "rate (Mbit/s) for the tc/HTB default class, which catches all traffic with no per-user mark (system traffic, and every user's own outbound-to-destination leg); 0 = auto-detect via ethtool on -iface")
 	flag.Uint64Var(&cfg.htbBurstMs, "htb-burst-ms", 100, "burst/cburst allowance for every tc/HTB class (default and per-user), in milliseconds' worth of bytes at that class's own rate; 0 = kernel's own default sizing (normally just a couple KB)")
-	flag.Uint64Var(&cfg.perUserRateMbit, "per-user-rate-mbit", 0, "if set, automatically provisions this rate (Mbit/s) for every newly allocated mark, applying it uniformly to every user with zero manual provisioning; 0 = don't auto-provision, manage rates by hand via PUT /marks/{mark}")
+	flag.Uint64Var(&cfg.perUserRateMbit, "per-user-rate-mbit", 0, "if set, automatically provisions this rate (Mbit/s) for every user's mark the first time it is seen, applying it uniformly to every user with zero manual provisioning; 0 = don't auto-provision, manage rates by hand via PUT /marks/{mark}")
+	flag.DurationVar(&cfg.classIdleTimeout, "class-idle-timeout", 6*time.Hour, "delete a user's tc/HTB class after it has sent nothing for this long (the user gets a new one on their next connection), and drop emails idle that long from GET /users; 0 = never delete classes, and GET /users keeps every email seen")
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
@@ -61,6 +64,10 @@ func main() {
 }
 
 func run(cfg config, log *slog.Logger) error {
+	if cfg.markRange != "" {
+		log.Warn("-mark-range is no longer used and is ignored: marks are computed from the email", "mark_range", cfg.markRange)
+	}
+
 	iface := cfg.iface
 	if iface == "" {
 		var err error
@@ -70,11 +77,26 @@ func run(cfg config, log *slog.Logger) error {
 		}
 	}
 
-	shaper, err := setupShaper(iface, cfg.defaultClassRateMbit, cfg.htbBurstMs, log)
+	queues := cfg.txQueues
+	if queues == 0 {
+		n, err := netif.TxQueueCount(iface)
+		if err != nil {
+			return fmt.Errorf("counting TX queues on %s (pass -tx-queues explicitly): %w", iface, err)
+		}
+		queues = n
+	}
+	if queues < 1 {
+		return fmt.Errorf("-tx-queues must be at least 1, got %d", queues)
+	}
+	if queues > mark.MaxQueues {
+		log.Warn("more TX queues than a mark can address; using only the first ones", "tx_queues", queues, "used", mark.MaxQueues)
+		queues = mark.MaxQueues
+	}
+
+	shaper, err := setupShaper(iface, queues, cfg.defaultClassRateMbit, cfg.htbBurstMs, log)
 	if err != nil {
 		return err
 	}
-	store := tcshape.WrapStore(limiter.NewMemoryStore(), shaper, log)
 
 	// A nil RateSetter tells the webhook handler not to provision rates.
 	var perUserRate webhook.RateSetter
@@ -86,20 +108,55 @@ func run(cfg config, log *slog.Logger) error {
 		if cfg.perUserRateMbit > math.MaxUint32/bytesPerSecPerMbit {
 			return fmt.Errorf("per-user-rate-mbit %d is too large: it must convert to at most 4294967295 bytes/sec (uint32 limit of the mark -> rate store), i.e. at most %d", cfg.perUserRateMbit, math.MaxUint32/bytesPerSecPerMbit)
 		}
-		perUserRate = store
 		perUserRateBytesPerSec = uint32(cfg.perUserRateMbit * bytesPerSecPerMbit)
-		log.Info("auto-provisioning per-user tc/HTB rate on allocation", "mbit", cfg.perUserRateMbit, "bytes_per_sec", perUserRateBytesPerSec)
+		log.Info("auto-provisioning per-user tc/HTB rate for every user seen", "mbit", cfg.perUserRateMbit, "bytes_per_sec", perUserRateBytesPerSec)
 	}
 
-	alloc := webhook.NewAllocator(cfg.marks.first, cfg.marks.count(), log)
+	// Classes outlive the process, and a user's mark is the same after a
+	// restart, so the classes already on the interface are adopted into
+	// the store: GET /marks lists them, and the webhook handler doesn't
+	// provision them again. With -per-user-rate-mbit, a class with another
+	// rate (the flag changed) is left out, so it is provisioned again on
+	// its user's next webhook.
+	classes, err := shaper.Classes()
+	if err != nil {
+		return fmt.Errorf("listing existing tc/HTB classes on %s: %w", iface, err)
+	}
+	base := limiter.NewMemoryStore()
+	for _, c := range classes {
+		if cfg.perUserRateMbit == 0 || c.RateBytesPerSec == perUserRateBytesPerSec {
+			if err := base.Set(c.Mark, c.RateBytesPerSec); err != nil {
+				return err
+			}
+		}
+	}
+	store := tcshape.WrapStore(base, shaper, log)
+	if cfg.perUserRateMbit > 0 {
+		perUserRate = store
+	}
 
-	apiSrv := &http.Server{Handler: api.New(store, alloc, log), ReadHeaderTimeout: readHeaderTimeout}
+	users := webhook.NewUsers(queues)
+	handler := webhook.New(users, conntrack.NewMarker(log), perUserRate, perUserRateBytesPerSec, log)
+
+	apiSrv := &http.Server{Handler: api.New(store, users, log), ReadHeaderTimeout: readHeaderTimeout}
 
 	webhookMux := http.NewServeMux()
-	webhookMux.Handle("/webhook/xray", webhook.New(alloc, conntrack.NewMarker(log), perUserRate, perUserRateBytesPerSec, log))
+	webhookMux.Handle("/webhook/xray", handler)
 	webhookSrv := &http.Server{Handler: webhookMux, ReadHeaderTimeout: readHeaderTimeout}
 
-	log.Info("shaping enabled", "iface", iface, "mark_range", cfg.marks.String())
+	log.Info("shaping enabled", "iface", iface, "tx_queues", queues, "existing_classes", len(classes))
+
+	if cfg.classIdleTimeout > 0 {
+		gc := tcshape.NewIdleCollector(shaper, store, cfg.classIdleTimeout, log)
+		go func() {
+			ticker := time.NewTicker(gcInterval(cfg.classIdleTimeout))
+			defer ticker.Stop()
+			for range ticker.C {
+				gc.Collect()
+				users.Prune(cfg.classIdleTimeout)
+			}
+		}()
+	}
 
 	errCh := make(chan error, 2)
 	if err := serve(apiSrv, cfg.addr, "http api", errCh, log); err != nil {
@@ -135,77 +192,39 @@ func run(cfg config, log *slog.Logger) error {
 	return webhookErr
 }
 
-// setupShaper makes sure iface has the root HTB qdisc, its default class
-// and the conntrack mark restore rule, and returns a Shaper for it.
-func setupShaper(iface string, defaultClassRateMbit, htbBurstMs uint64, log *slog.Logger) (*tcshape.Shaper, error) {
-	rootExists, err := tcshape.RootQdiscExists(iface)
+// setupShaper makes sure iface has the per-queue HTB layout, the
+// steering filters and the conntrack mark restore rule, and returns a
+// Shaper for it.
+func setupShaper(iface string, queues int, defaultClassRateMbit, htbBurstMs uint64, log *slog.Logger) (*tcshape.Shaper, error) {
+	shaper := tcshape.New(iface, queues, htbBurstMs)
+	layoutExists, err := shaper.LayoutExists()
 	if err != nil {
 		return nil, fmt.Errorf("checking existing tc/HTB state on %s: %w", iface, err)
 	}
 
-	// The default class rate only matters when the root qdisc is created
-	// here; an existing one keeps whatever rate its default class already has.
-	if !rootExists && defaultClassRateMbit == 0 {
-		defaultClassRateMbit, err = netif.DetectLinkSpeedMbps(iface)
-		if err != nil {
-			return nil, fmt.Errorf("auto-detecting link speed on %s (pass -default-class-rate-mbit explicitly if this interface doesn't support ethtool speed reporting): %w", iface, err)
+	// The default class rate only matters when the layout is built here;
+	// an existing one keeps whatever rate its default classes already have.
+	if !layoutExists {
+		if defaultClassRateMbit == 0 {
+			defaultClassRateMbit, err = netif.DetectLinkSpeedMbps(iface)
+			if err != nil {
+				return nil, fmt.Errorf("auto-detecting link speed on %s (pass -default-class-rate-mbit explicitly if this interface doesn't support ethtool speed reporting): %w", iface, err)
+			}
+			log.Info("auto-detected link speed for tc default classes", "iface", iface, "mbit", defaultClassRateMbit)
 		}
-		log.Info("auto-detected link speed for tc default class", "iface", iface, "mbit", defaultClassRateMbit)
+		log.Warn("building the per-queue tc/HTB layout; this replaces the root qdisc and every class under it", "iface", iface, "tx_queues", queues)
 	}
 
-	shaper := tcshape.New(iface, defaultClassRateMbit, htbBurstMs)
-	if err := shaper.EnsureRoot(rootExists); err != nil {
+	if err := shaper.EnsureRoot(layoutExists, defaultClassRateMbit); err != nil {
 		return nil, fmt.Errorf("setting up tc/HTB on %s: %w", iface, err)
 	}
 	return shaper, nil
 }
 
-// markRange is an inclusive range of marks, set from a "first-last" flag
-// value such as "20000-39999".
-type markRange struct {
-	first, last uint32
-}
-
-func (r *markRange) String() string {
-	return fmt.Sprintf("%d-%d", r.first, r.last)
-}
-
-// Set parses and validates a "first-last" range. Every mark must fit in
-// 16 bits because it doubles as an HTB classid minor number (see
-// tcshape.classIDFor), mark 0 means "no mark" to the kernel, and mark 1
-// would encode to the default class 1:1.
-func (r *markRange) Set(s string) error {
-	firstStr, lastStr, ok := strings.Cut(s, "-")
-	if !ok {
-		return errors.New(`must look like "first-last", e.g. 20000-39999`)
-	}
-	first, err := strconv.ParseUint(firstStr, 10, 32)
-	if err != nil {
-		return fmt.Errorf("invalid first mark %q", firstStr)
-	}
-	last, err := strconv.ParseUint(lastStr, 10, 32)
-	if err != nil {
-		return fmt.Errorf("invalid last mark %q", lastStr)
-	}
-
-	switch {
-	case first == 0:
-		return errors.New("mark 0 means \"no mark\" and can't be handed out")
-	case first < tcshape.MinMark:
-		return fmt.Errorf("mark %d would be the tc/HTB default class 1:1; start the range at %d or above", first, tcshape.MinMark)
-	case last > tcshape.MaxMark:
-		return fmt.Errorf("marks must not exceed %d (HTB classids are 16-bit)", tcshape.MaxMark)
-	case first > last:
-		return fmt.Errorf("first mark %d is greater than last mark %d", first, last)
-	}
-
-	r.first, r.last = uint32(first), uint32(last)
-	return nil
-}
-
-// count returns how many marks the range holds.
-func (r *markRange) count() uint32 {
-	return r.last - r.first + 1
+// gcInterval is how often idle classes are looked for: often enough that
+// a class goes soon after its idle timeout, at most every 10 minutes.
+func gcInterval(idle time.Duration) time.Duration {
+	return max(min(idle/4, 10*time.Minute), time.Minute)
 }
 
 // serve starts listening on addr and runs srv on it in the background,

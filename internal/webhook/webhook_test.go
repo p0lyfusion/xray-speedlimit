@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/p0lyfusion/xray-speedlimit/internal/mark"
 )
 
 type fakeMarker struct {
@@ -31,6 +33,9 @@ func (f *fakeMarker) SetMark(proto string, srcIP net.IP, srcPort uint16, dstIP n
 	return f.err
 }
 
+// userAMark is the mark "user-a" gets with the 4 queues these tests use.
+var userAMark = mark.For("user-a", 4)
+
 type fakeRateSetter struct {
 	mu       sync.Mutex
 	rates    map[uint32]uint32
@@ -40,6 +45,19 @@ type fakeRateSetter struct {
 
 func newFakeRateSetter() *fakeRateSetter {
 	return &fakeRateSetter{rates: make(map[uint32]uint32)}
+}
+
+func (f *fakeRateSetter) Get(mark uint32) (uint32, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	rate, ok := f.rates[mark]
+	return rate, ok
+}
+
+func (f *fakeRateSetter) Delete(mark uint32) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.rates, mark)
 }
 
 func (f *fakeRateSetter) Set(mark uint32, rateBytesPerSec uint32) error {
@@ -63,7 +81,7 @@ func post(t *testing.T, h http.Handler, body string) *httptest.ResponseRecorder 
 
 func TestHandlerMarksRealEvent(t *testing.T) {
 	marker := &fakeMarker{}
-	h := New(NewAllocator(1000, 10, nil), marker, nil, 0, nil)
+	h := New(NewUsers(4), marker, nil, 0, nil)
 
 	body := `{
 		"email": "user-a",
@@ -91,14 +109,14 @@ func TestHandlerMarksRealEvent(t *testing.T) {
 	}
 	c := marker.calls[0]
 	if c.proto != "tcp" || c.srcPort != 54203 || c.dstPort != 443 ||
-		c.srcIP.String() != "203.0.113.7" || c.dstIP.String() != "198.51.100.1" {
+		c.srcIP.String() != "203.0.113.7" || c.dstIP.String() != "198.51.100.1" || c.mark != userAMark {
 		t.Fatalf("unexpected call: %+v", c)
 	}
 }
 
 func TestHandlerStableMarkAcrossCalls(t *testing.T) {
 	marker := &fakeMarker{}
-	h := New(NewAllocator(1, 10, nil), marker, nil, 0, nil)
+	h := New(NewUsers(4), marker, nil, 0, nil)
 
 	body := `{"email":"user-a","network":"tcp","source":"1.1.1.1:1","inboundLocal":"2.2.2.2:2"}`
 	post(t, h, body)
@@ -129,15 +147,15 @@ func (f *fakeRateSetter) calls() int {
 	return f.setCalls
 }
 
-func TestHandlerProvisionsRateOnlyOnFirstAllocation(t *testing.T) {
+func TestHandlerProvisionsRateOnlyOnce(t *testing.T) {
 	marker := &fakeMarker{}
 	rate := newFakeRateSetter()
-	h := New(NewAllocator(1, 10, nil), marker, rate, 12_500_000, nil)
+	h := New(NewUsers(4), marker, rate, 12_500_000, nil)
 
 	body := `{"email":"user-a","network":"tcp","source":"1.1.1.1:1","inboundLocal":"2.2.2.2:2"}`
 	post(t, h, body)
 	post(t, h, body)
-	waitFor(t, "provisioning", func() bool { _, ok := h.provisioned.Load(uint32(1)); return ok })
+	waitFor(t, "provisioning", func() bool { _, ok := rate.Get(userAMark); return ok })
 	post(t, h, body)
 
 	marker.mu.Lock()
@@ -158,7 +176,7 @@ func TestHandlerRateSetterErrorStillMarks(t *testing.T) {
 	marker := &fakeMarker{}
 	rate := newFakeRateSetter()
 	rate.err = errors.New("tc failed")
-	h := New(NewAllocator(1, 10, nil), marker, rate, 12_500_000, nil)
+	h := New(NewUsers(4), marker, rate, 12_500_000, nil)
 
 	rec := post(t, h, `{"email":"user-a","source":"1.1.1.1:1","inboundLocal":"2.2.2.2:2"}`)
 	if rec.Code != http.StatusOK {
@@ -176,6 +194,8 @@ type blockingRateSetter struct {
 	release chan struct{}
 }
 
+func (b *blockingRateSetter) Get(uint32) (uint32, bool) { return 0, false }
+
 func (b *blockingRateSetter) Set(uint32, uint32) error {
 	<-b.release
 	return nil
@@ -185,7 +205,7 @@ func TestHandlerMarksWithoutWaitingForProvisioning(t *testing.T) {
 	marker := &fakeMarker{}
 	rate := &blockingRateSetter{release: make(chan struct{})}
 	defer close(rate.release)
-	h := New(NewAllocator(1, 10, nil), marker, rate, 12_500_000, nil)
+	h := New(NewUsers(4), marker, rate, 12_500_000, nil)
 
 	done := make(chan int, 2)
 	for _, email := range []string{"user-a", "user-b"} {
@@ -213,14 +233,13 @@ func TestHandlerMarksWithoutWaitingForProvisioning(t *testing.T) {
 func TestHandlerRetriesProvisioningAfterFailure(t *testing.T) {
 	rate := newFakeRateSetter()
 	rate.err = errors.New("tc failed")
-	h := New(NewAllocator(1, 10, nil), &fakeMarker{}, rate, 12_500_000, nil)
+	h := New(NewUsers(4), &fakeMarker{}, rate, 12_500_000, nil)
 
 	body := `{"email":"user-a","source":"1.1.1.1:1","inboundLocal":"2.2.2.2:2"}`
-	notQueued := func() bool { _, ok := h.queued.Load(uint32(1)); return !ok }
+	notQueued := func() bool { _, ok := h.queued.Load(userAMark); return !ok }
 
-	// The allocator hands out the mark for user-a on this first call even
-	// though provisioning then fails, so a naive "only on first allocation"
-	// gate would never retry -- confirm it does.
+	// The first attempt fails; a gate that provisioned each mark only the
+	// first time it was seen would never retry -- confirm it does.
 	post(t, h, body)
 	waitFor(t, "the failing attempt", func() bool { return rate.calls() == 1 && notQueued() })
 
@@ -231,10 +250,10 @@ func TestHandlerRetriesProvisioningAfterFailure(t *testing.T) {
 	post(t, h, body)
 	waitFor(t, "the retry", func() bool { return rate.calls() == 2 && notQueued() })
 	rate.mu.Lock()
-	got, ok := rate.rates[1]
+	got, ok := rate.rates[userAMark]
 	rate.mu.Unlock()
 	if !ok || got != 12_500_000 {
-		t.Fatalf("expected mark 1 provisioned at 12500000 bytes/sec after recovery, got %v (present=%v)", got, ok)
+		t.Fatalf("expected user-a's mark provisioned at 12500000 bytes/sec after recovery, got %v (present=%v)", got, ok)
 	}
 
 	// A third call must not call Set again now that it succeeded once.
@@ -247,7 +266,7 @@ func TestHandlerRetriesProvisioningAfterFailure(t *testing.T) {
 
 func TestHandlerNilRateSetterSkipsProvisioning(t *testing.T) {
 	marker := &fakeMarker{}
-	h := New(NewAllocator(1, 10, nil), marker, nil, 0, nil)
+	h := New(NewUsers(4), marker, nil, 0, nil)
 
 	rec := post(t, h, `{"email":"user-a","source":"1.1.1.1:1","inboundLocal":"2.2.2.2:2"}`)
 	if rec.Code != http.StatusOK {
@@ -256,7 +275,7 @@ func TestHandlerNilRateSetterSkipsProvisioning(t *testing.T) {
 }
 
 func TestHandlerInvalidJSON(t *testing.T) {
-	h := New(NewAllocator(1, 10, nil), &fakeMarker{}, nil, 0, nil)
+	h := New(NewUsers(4), &fakeMarker{}, nil, 0, nil)
 	rec := post(t, h, `{not json`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", rec.Code)
@@ -265,7 +284,7 @@ func TestHandlerInvalidJSON(t *testing.T) {
 
 func TestHandlerMissingFieldsNoOp(t *testing.T) {
 	marker := &fakeMarker{}
-	h := New(NewAllocator(1, 10, nil), marker, nil, 0, nil)
+	h := New(NewUsers(4), marker, nil, 0, nil)
 
 	cases := []string{
 		`{}`,
@@ -291,7 +310,7 @@ func TestHandlerMissingFieldsNoOp(t *testing.T) {
 
 func TestHandlerMarkerError(t *testing.T) {
 	marker := &fakeMarker{err: errors.New("boom")}
-	h := New(NewAllocator(1, 10, nil), marker, nil, 0, nil)
+	h := New(NewUsers(4), marker, nil, 0, nil)
 
 	rec := post(t, h, `{"email":"user-a","source":"1.1.1.1:1","inboundLocal":"2.2.2.2:2"}`)
 	if rec.Code != http.StatusInternalServerError {
@@ -341,7 +360,7 @@ func (d *diagnosingMarker) DiagnoseMiss(net.IP, uint16, uint16) ([]any, error) {
 
 func TestHandlerDiagnosesMissOncePerInterval(t *testing.T) {
 	marker := &diagnosingMarker{fakeMarker: fakeMarker{err: errors.New("boom")}, diagnosed: make(chan struct{}, 10)}
-	h := New(NewAllocator(1, 10, nil), marker, nil, 0, nil)
+	h := New(NewUsers(4), marker, nil, 0, nil)
 
 	for range 5 {
 		post(t, h, `{"email":"user-a","source":"1.1.1.1:1","inboundLocal":"2.2.2.2:2"}`)
@@ -364,4 +383,51 @@ func TestHandlerDiagnosesMissOncePerInterval(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected another diagnosis once the interval passed")
 	}
+}
+
+func TestHandlerQueueFullDoesNotBlock(t *testing.T) {
+	marker := &fakeMarker{}
+	rate := &blockingRateSetter{release: make(chan struct{})}
+	defer close(rate.release)
+	h := New(NewUsers(4), marker, rate, 12_500_000, nil)
+
+	// The worker takes one mark and blocks in Set; fill the rest of the
+	// queue, then one more webhook must still go through.
+	for i := range provisionQueueSize + 1 {
+		h.queueProvision(uint32(0x10000 | (i + 2)))
+	}
+	done := make(chan int, 1)
+	go func() {
+		done <- post(t, h, `{"email":"user-a","source":"1.1.1.1:1","inboundLocal":"2.2.2.2:2"}`).Code
+	}()
+	select {
+	case code := <-done:
+		if code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("webhook blocked on a full provisioning queue")
+	}
+	if _, ok := h.queued.Load(userAMark); ok {
+		t.Fatal("a mark that didn't fit must not stay recorded as queued, or it would never be retried")
+	}
+}
+
+func TestHandlerSkipsMarksThatHaveARate(t *testing.T) {
+	rate := newFakeRateSetter()
+	rate.rates[userAMark] = 1 // e.g. adopted at startup, or set through the API
+	h := New(NewUsers(4), &fakeMarker{}, rate, 12_500_000, nil)
+
+	body := `{"email":"user-a","source":"1.1.1.1:1","inboundLocal":"2.2.2.2:2"}`
+	post(t, h, body)
+	time.Sleep(20 * time.Millisecond)
+	if rate.calls() != 0 {
+		t.Fatal("a mark that already has a rate must not be provisioned again")
+	}
+
+	// Once its rate is gone (idle class deleted, DELETE /marks), the next
+	// webhook provisions it again.
+	rate.Delete(userAMark)
+	post(t, h, body)
+	waitFor(t, "reprovisioning", func() bool { return rate.calls() == 1 })
 }

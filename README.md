@@ -7,49 +7,220 @@ Per-user bandwidth limits for [Xray-core](https://github.com/XTLS/Xray-core), en
 Xray-core only learns which user owns a connection after it has decrypted and parsed the handshake, so nothing at L3/L4 can tell users apart on its own. This service connects the two sides:
 
 1. Xray-core's stock routing `webhook` action POSTs an event to `/webhook/xray` for every routed connection. The event carries the user's `email` and the client-facing 4-tuple (`source`, `inboundLocal`).
-2. The service gives each `email` its own mark from `-mark-range`. The mark stays the same for as long as the process runs.
+2. The service computes the user's mark from their `email` (see [Marks](#marks)). The same email always gets the same mark, across restarts too.
 3. It sets that mark on the client connection's conntrack entry over netlink, with one `IPCTNL_MSG_CT_NEW` update keyed by the connection's exact tuple. The kernel finds the entry with a hash lookup, so the cost doesn't grow with the size of the conntrack table. When Xray reports the local address as `0.0.0.0` or `::`, the service tries each address assigned to a local interface in the client's address family and marks every entry it finds. A connection whose local address isn't assigned to an interface (AnyIP routes, TPROXY) can't be marked.
 4. An nftables rule (`ct mark != 0 meta mark set ct mark`, in table `inet xray_speedlimit`) copies the conntrack mark onto each outgoing packet of a marked connection. Packets of unmarked connections keep whatever mark they already had. The service re-applies this table on every start.
-5. A root HTB qdisc on `-iface` has one class plus two `fw` filters (IPv4 and IPv6) per mark, so each user's packets land in their own rate-limited class.
+5. On `-iface`, an `mq` root qdisc gives every TX queue its own HTB qdisc. A clsact egress filter moves each marked packet onto the TX queue its mark names, and that queue's HTB puts it in the user's rate-limited class.
 
 ```
-Xray webhook POST ─→ allocator (email → mark) ─→ conntrack mark (netlink)
-                                                        │
-                    nft "meta mark set ct mark" ←───────┘
-                                │
-                    tc fw filter ─→ HTB class for that mark (rate cap)
+Xray webhook POST ─→ hash(email) → mark ─→ conntrack mark (netlink)
+                                                  │
+                  nft "meta mark set ct mark" ←───┘
+                              │
+          clsact egress: skbedit queue_mapping (from the mark's queue field)
+                              │
+          mq ─→ HTB of that TX queue ─→ fw (classid = mark) ─→ user's class
 ```
+
+The layout on the interface:
+
+```
+root mq 8000:
+  8000:<q> → htb <q>: default 1        one per TX queue, q = 1..queues
+                class <q>:1            default class, at link rate
+                class <q>:<minor>      one per user
+                filter fw              no entries: uses the mark as the classid
+clsact egress, pref 49000
+  fw mark <q><<16/0xff0000 → skbedit queue_mapping <q-1>
+```
+
+A single HTB qdisc has one lock that every packet on the interface takes, which on a many-core, many-queue NIC turns into softirq contention. With one HTB per TX queue, each queue has its own lock. A user always maps to one queue, so all of their connections still share one class.
 
 A rate lives on a user's HTB class, not on individual connections. All of that user's connections share it, so opening parallel connections doesn't multiply the cap.
 
 Only **egress** is shaped, meaning server → client, which is the client's download. Shaping upload as well would need `ifb` plus the tc `connmark` action, and `act_connmark` isn't available on every kernel. It is deliberately not implemented.
 
+### Step by step: one user, one packet
+
+This follows one user through the whole path. The example host has 48 TX queues on `eth0`, runs with `-per-user-rate-mbit 120 -htb-burst-ms 1000`, and the user's email is `alice@example.com`.
+
+#### 1. The email becomes a mark
+
+The mark is computed from the email alone (`internal/mark`); nothing is looked up or stored.
+
+```
+email          "alice@example.com"
+                        │
+                        │  FNV-1a, 64-bit
+                        ▼
+sum            0x67023fc4a7ff2a46
+                        │
+         ┌──────────────┴──────────────────────┐
+         │ sum mod 48                          │ (sum div 48) mod 65534, + 2
+         ▼                                     ▼
+queue index    22                     minor   6409 = 0x1909
+major          23 = 0x17  (queue index + 1)
+                        │
+                        ▼
+mark = major << 16 | minor = 0x00171909 = 1513737
+```
+
+The 32-bit mark is laid out like this:
+
+```
+ 31        24 23        16 15                        0
+┌────────────┬────────────┬───────────────────────────┐
+│  00000000  │  00010111  │     0001100100001001      │
+│   unused   │ major 0x17 │       minor 0x1909        │
+└────────────┴────────────┴───────────────────────────┘
+              queue field     class inside the queue
+              (mask 0xff0000)
+```
+
+- `major` (1..48 here) names both the TX queue (`major - 1`, so queue 22) and the HTB qdisc on it (handle `17:`, since tc handles are hex).
+- `minor` (2..65535) names the user's class inside that HTB. Minor 1 is the queue's default class, and 0 isn't a valid class, so hashes never land there.
+- The same email gives the same mark every time, on every start, as long as the queue count stays 48.
+
+#### 2. What the user has in the kernel
+
+The service builds this tree once. Only the user's own class is per-user:
+
+```
+eth0
+├─ root  qdisc mq 8000:
+│   ├─ class 8000:1  (TX queue 0)  ─→ qdisc htb 1:  ─┬─ class 1:1    default, 10 Gbit
+│   │                                                ├─ class 1:…    other users
+│   │                                                └─ filter fw    (no entries)
+│   ├─ …
+│   ├─ class 8000:17 (TX queue 22) ─→ qdisc htb 17: ─┬─ class 17:1     default, 10 Gbit
+│   │                                                ├─ class 17:1909  ← this user, 120 Mbit
+│   │                                                ├─ class 17:…     other users on queue 22
+│   │                                                └─ filter fw      (no entries)
+│   ├─ …
+│   └─ class 8000:30 (TX queue 47) ─→ qdisc htb 30: ─ …
+│
+└─ clsact  (egress hook, runs before a TX queue is picked)
+    ├─ filter fw handle 0x10000/0xff0000  → skbedit queue_mapping 0
+    ├─ …
+    ├─ filter fw handle 0x170000/0xff0000 → skbedit queue_mapping 22
+    ├─ …
+    └─ filter fw handle 0x300000/0xff0000 → skbedit queue_mapping 47
+```
+
+The user's class is created the first time the service sees them:
+
+```
+tc class replace dev eth0 parent 17: classid 17:1909 \
+    htb rate 120000000bit burst 15000000b cburst 15000000b
+```
+
+`burst` is 1000 ms of the class's own rate: 15 MB/s × 1 s.
+
+#### 3. A connection gets marked
+
+The user connects, and Xray POSTs:
+
+```json
+{"email": "alice@example.com", "network": "tcp",
+ "source": "203.0.113.7:20416", "inboundLocal": "[::]:443", ...}
+```
+
+The service then:
+
+1. Computes the mark `0x171909` (step 1).
+2. Checks the store for a rate on `0x171909`. If there is none, it queues the mark for the background provisioning worker, which runs the `tc class replace` above. The webhook doesn't wait for it.
+3. Writes `mark=0x171909` onto the connection's conntrack entry. `inboundLocal` is `[::]`, which says nothing about the local address, so it tries each IPv4 address assigned to the host, one exact-tuple lookup each, until it hits the entry for `203.0.113.7:20416 → 198.51.100.1:443`.
+
+#### 4. A packet goes out
+
+The server sends the user a packet on that connection:
+
+```
+Xray writes to the socket
+        │
+        ▼
+nft postrouting   ct mark != 0 → meta mark set ct mark
+        │         skb->mark = 0x171909
+        ▼
+clsact egress     fw: 0x171909 & 0xff0000 = 0x170000 → matches the queue-22 filter
+        │         skbedit queue_mapping 22
+        ▼
+TX queue 22       the kernel skips its own queue choice (XPS/hash)
+        │
+        ▼
+mq 8000:17 → htb 17:
+        │         fw (no entries): the mark's major 0x17 is this qdisc's handle,
+        │         so classid = mark = 17:1909
+        ▼
+class 17:1909     120 Mbit token bucket: sent now, or queued until tokens refill
+        │
+        ▼
+NIC TX ring 22 ─→ wire
+```
+
+Only CPUs sending on queue 22 contend for `htb 17:`'s lock. The other 47 queues have their own.
+
+A packet with no mark, such as the same user's server → destination leg, or system traffic, takes the other branch:
+
+```
+skb->mark = 0 ─→ clsact: no filter matches ─→ the kernel picks a TX queue as usual, say 7
+             ─→ htb 8: ─→ fw: mark 0 gives no class ─→ default class 8:1 (link rate)
+```
+
+#### 5. The class over time
+
+```
+first webhook   no rate in the store → tc class replace … 17:1909   (background)
+later webhooks  rate in the store → nothing to do; only the conntrack mark is written
+restart         layout found → adopted as-is; class 17:1909 found → rate put in the store
+6h no traffic   the idle collector deletes class 17:1909 and its store entry
+comes back      no rate in the store → class 17:1909 is created again
+```
+
+Between the first webhook and the class existing (usually milliseconds, longer after a rebuild), the user's packets ride `17:1`, queue 22's default class, unshaped.
+
+#### 6. When two users collide
+
+Two emails whose hashes agree on both `sum mod 48` and `(sum div 48) mod 65534` get the same mark, and so the same class. Their connections then share one 120 Mbit bucket: each still gets the full rate while the other is idle, and they split it when both are busy. With 48 × 65534 ≈ 3.1 million marks, that happens to about 0.2% of users at 7,000 concurrent users.
+
 ### Rates
 
 Every user needs an HTB class. There are two ways to get one:
 
-- **Automatic**: with `-per-user-rate-mbit`, the webhook handler creates the class with that rate the first time it gives an email a mark, before marking the connection. If that fails (for example `tc` errors), the handler retries on the user's next webhook.
+- **Automatic**: with `-per-user-rate-mbit`, the webhook handler creates the class with that rate the first time it sees the user's mark. A single background worker does this, so marking a connection never waits for `tc`. Until the class exists, the user's traffic rides their queue's default class. If creating it fails (for example `tc` errors), the handler retries on the user's next webhook.
 - **Manual**: `PUT /marks/{mark}` sets or changes any mark's rate. Use `GET /users` to find which mark belongs to which email.
 
-A mark with no class rides the default class (`1:1`). So do unmarked traffic, system traffic, and each user's own server → destination leg, since only the client-facing conntrack entry is ever marked. The default class's rate therefore has to match the interface's real link capacity, or it turns into a shared bottleneck:
+Classes live in the kernel, so they survive a restart of the service. On startup the service adopts the classes it finds: `GET /marks` lists them, and they aren't provisioned again. With `-per-user-rate-mbit`, a mark is provisioned whenever it has no rate: after `DELETE /marks`, or after its idle class was deleted, its user's next connection gives it the per-user rate again.
+
+Classes of users who have gone away are deleted after `-class-idle-timeout` (6 hours by default) without traffic, since otherwise every email ever seen would keep a class. A returning user gets a new one on their next connection. A rate set by hand through `PUT /marks` is deleted the same way.
+
+A mark with no class rides its queue's default class (`<q>:1`). So do unmarked traffic, system traffic, and each user's own server → destination leg, since only the client-facing conntrack entry is ever marked. Each queue's default class gets the interface's full link rate, so it never becomes a bottleneck of its own:
 
 - Left at `0`, `-default-class-rate-mbit` is detected with `ethtool` on `-iface`.
-- Detection only happens the first time, while the root qdisc doesn't exist yet. On a restart against an already-set-up interface, the existing class keeps its rate and `ethtool` isn't run.
+- Detection only happens when the layout is built. On a restart against an already-set-up interface, the existing classes keep their rates and `ethtool` isn't run.
 - Startup fails if `ethtool` can't report a speed, which is common on virtual interfaces (veth, tun/tap, wireguard). Pass the flag explicitly in that case.
 
 Without an explicit burst, HTB sizes a class's token bucket from its rate alone. That is usually a couple of KB, too small to absorb a page load or TCP slow start without extra throttling. `-htb-burst-ms` sets the bucket size as a duration instead: every class gets `rate * htb-burst-ms / 8000` bytes of burst, floored at 2 KB so `tc` never rejects it as too small.
 
 ### Marks
 
-`-mark-range` is inclusive on both ends, and startup checks it:
+A mark is `(q << 16) | minor`: `q` (1 to the queue count) picks the TX queue and its HTB, and `minor` (2-65535) picks the class inside it. Both come from an FNV-1a hash of the email, so:
 
-- It must lie within `2-65535`, because each mark is also an HTB classid minor number, which is 16 bits.
-- Mark `0` means "no mark" and is never handed out. Mark `1` would be classid `1:1`, the default class.
-- Keep the range disjoint from any other marks used on the host. Everything ends up in the same `skb->mark`.
+- The same email always gets the same mark. Nothing is stored, a restart changes nothing, and marks never run out.
+- Users spread evenly over the TX queues.
+- Two emails can hash to the same mark, and then share one class and its rate. With `Q` queues there are `Q × 65534` marks, so on 48 queues about 0.2% of 7,000 concurrent users share a class with someone.
 
-When the range is used up, the service logs one warning. Later new users go unmarked and ride the default class.
+Every mark depends on the queue count, which is every TX queue `-iface` has in use unless `-tx-queues` says otherwise (at most 255). If it changes, for example with `ethtool -L`, the next start rebuilds the layout and every user gets a new mark.
 
-The email → mark table lives in memory only. After a restart, marks are handed out again in whatever order users reconnect, so an email may get a different mark than before. Existing HTB classes survive the restart, and they're keyed by mark, not email. Tools that read `GET /users` should re-read it after a restart rather than cache it.
+Marks use bits 16-23 of the packet mark. Nothing else on the host may use those bits: the steering filters and the fw classifiers act on the whole `skb->mark`.
+
+Building the layout replaces the root qdisc, dropping whatever tree was there, including the single root HTB older versions of this service built. Connections marked under that old layout carry marks that match no class, so they ride their queue's default class until a webhook re-marks them.
+
+`GET /users` lists the emails seen in the last `-class-idle-timeout`.
+
+With `-per-user-rate-mbit`, a class the service finds at startup is only adopted if it already has that rate. Change the flag and every user's class is updated on their next connection. Changing `-htb-burst-ms` doesn't touch existing classes: it applies to classes created after it (existing ones pick it up once they go idle and are recreated).
+
+To roll back to a version from before this layout, delete the root qdisc first (`tc qdisc del dev <iface> root`). Those versions decide whether their tree exists by looking for an `htb 1:` qdisc, which this layout also contains (under TX queue 0), and would otherwise put every class under that one queue.
 
 ### The webhook listener
 
@@ -114,17 +285,24 @@ The image includes `iproute2` (`tc`), `nftables` and `ethtool`, which the servic
       (default "@xray-speedlimit-webhook")
 -iface string
       network interface for tc/HTB shaping (default: the interface used by the default route)
--mark-range value
-      inclusive range of marks handed out to users, as first-last; must lie within
-      2-65535 (default 20000-39999)
+-tx-queues int
+      number of TX queues to spread users over, one HTB qdisc each (at most 255);
+      0 = every TX queue -iface has in use
+-mark-range string
+      no longer used: accepted and ignored so older configs keep working
 -default-class-rate-mbit uint
-      rate (Mbit/s) for the tc/HTB default class; 0 = auto-detect via ethtool on -iface
+      rate (Mbit/s) for each queue's tc/HTB default class; 0 = auto-detect via
+      ethtool on -iface
 -htb-burst-ms uint
       burst/cburst for every tc/HTB class, in milliseconds' worth of bytes at that
       class's own rate; 0 = kernel's default sizing (default 100)
 -per-user-rate-mbit uint
-      if set, automatically provisions this rate (Mbit/s) for every newly allocated
-      mark; 0 = manage rates by hand via PUT /marks/{mark}
+      if set, automatically provisions this rate (Mbit/s) for every user's mark the
+      first time it is seen; 0 = manage rates by hand via PUT /marks/{mark}
+-class-idle-timeout duration
+      delete a user's class after it has sent nothing for this long, and drop
+      emails idle that long from GET /users; 0 = never, and GET /users keeps
+      every email seen (default 6h0m0s)
 ```
 
 ## HTTP API
@@ -134,19 +312,19 @@ Served on `-addr`.
 ### `PUT /marks/{mark}`: set or update a limit
 
 ```
-curl -X PUT localhost:7070/marks/20000 \
+curl -X PUT localhost:7070/marks/2349593 \
   -d '{"rate_bytes_per_sec": 1000000}'
 ```
 
-Returns `{"mark":20000,"rate_bytes_per_sec":1000000}` on success. `mark` must fit in a `uint32`, and `rate_bytes_per_sec` must be between 1 and 4294967295. Setting a rate needs a mark in `2-65535`, because it creates an HTB class (and `1:1` is the default class), so any other mark gets a 500.
+Returns `{"mark":2349593,"rate_bytes_per_sec":1000000}` on success. `mark` must fit in a `uint32`, and `rate_bytes_per_sec` must be between 1 and 4294967295. Setting a rate creates an HTB class, so the mark has to be one a user can get (see [Marks](#marks)); any other mark gets a 500.
 
 ### `DELETE /marks/{mark}`: remove a limit
 
 ```
-curl -X DELETE localhost:7070/marks/20000
+curl -X DELETE localhost:7070/marks/2349593
 ```
 
-Returns `204 No Content` whether or not the mark had an entry. The mark's traffic falls back to the default class.
+Returns `204 No Content` whether or not the mark had an entry. The mark's traffic falls back to its queue's default class.
 
 ### `GET /marks`: list current limits
 
@@ -155,7 +333,7 @@ curl localhost:7070/marks
 ```
 
 ```json
-[{"mark":20000,"rate_bytes_per_sec":1000000}]
+[{"mark":2349593,"rate_bytes_per_sec":1000000}]
 ```
 
 ### `GET /users`: list the email → mark table with each user's limit
@@ -165,7 +343,7 @@ curl localhost:7070/users
 ```
 
 ```json
-[{"email":"alice@example.com","mark":20000,"rate_bytes_per_sec":12500000},{"email":"bob@example.com","mark":20001}]
+[{"email":"alice@example.com","mark":2349593,"rate_bytes_per_sec":12500000},{"email":"bob@example.com","mark":1903858}]
 ```
 
 `rate_bytes_per_sec` is the mark's current limit, as in `GET /marks`. It's omitted when the mark has no limit, so that user rides the default class. Sorted by mark, and `[]` when no user has connected yet. See [Marks](#marks) for what happens to this table on restart.
@@ -194,4 +372,9 @@ go test ./... -p 1
 
 Most tests are plain unit tests and need nothing special.
 
-`internal/conntrack/conntrack_live_test.go` marks real conntrack entries. It needs root, `CAP_NET_ADMIN` and `nft`, and skips itself with a reason when those aren't available. `-p 1` stops it from racing other packages over shared kernel state.
+Two live tests touch real kernel state and skip themselves with a reason when they can't run:
+
+- `internal/conntrack/conntrack_live_test.go` marks real conntrack entries. It needs root, `CAP_NET_ADMIN`, `nft` and `ip`.
+- `internal/tcshape/tcshape_live_test.go` builds the layout on a 4-queue veth and checks that marked IPv4 and IPv6 packets reach their class. It needs root, `CAP_NET_ADMIN`, `tc`, `ip` and `nft`.
+
+`unshare -rn` runs both without real root or touching the host: build the test binary with `go test -c`, then run it under `unshare -rn` after `ip link set lo up`. `-p 1` stops the live tests from racing each other over shared kernel state.

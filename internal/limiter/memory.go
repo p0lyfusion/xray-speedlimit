@@ -28,6 +28,13 @@ func (s *memoryStore) Delete(mark uint32) error {
 	return nil
 }
 
+func (s *memoryStore) Get(mark uint32) (uint32, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rate, ok := s.entries[mark]
+	return rate, ok
+}
+
 func (s *memoryStore) List() ([]Entry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

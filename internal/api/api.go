@@ -15,7 +15,7 @@ import (
 )
 
 // UserMarks reports which mark each user (by email) has been given.
-// webhook.Allocator satisfies this.
+// webhook.Users satisfies this.
 type UserMarks interface {
 	Marks() map[string]uint32
 }
