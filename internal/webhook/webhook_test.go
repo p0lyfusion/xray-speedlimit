@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 type fakeMarker struct {
@@ -268,5 +269,42 @@ func TestParseHostPort(t *testing.T) {
 		if ip.String() != tc.wantIP {
 			t.Errorf("parseHostPort(%q): ip = %v, want %v", tc.in, ip, tc.wantIP)
 		}
+	}
+}
+
+type diagnosingMarker struct {
+	fakeMarker
+	diagnosed chan struct{}
+}
+
+func (d *diagnosingMarker) DiagnoseMiss(net.IP, uint16, uint16) ([]any, error) {
+	d.diagnosed <- struct{}{}
+	return []any{"hint", "test"}, nil
+}
+
+func TestHandlerDiagnosesMissOncePerInterval(t *testing.T) {
+	marker := &diagnosingMarker{fakeMarker: fakeMarker{err: errors.New("boom")}, diagnosed: make(chan struct{}, 10)}
+	h := New(NewAllocator(1, 10, nil), marker, nil, 0, nil)
+
+	for range 5 {
+		post(t, h, `{"email":"user-a","source":"1.1.1.1:1","inboundLocal":"2.2.2.2:2"}`)
+	}
+	select {
+	case <-marker.diagnosed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected a diagnosis after a failed mark")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := len(marker.diagnosed); n != 0 {
+		t.Fatalf("expected one diagnosis per interval, got %d more", n)
+	}
+
+	// Once the interval has passed, the next failure diagnoses again.
+	h.lastDiagnose.Add(-int64(missDiagnoseInterval))
+	post(t, h, `{"email":"user-a","source":"1.1.1.1:1","inboundLocal":"2.2.2.2:2"}`)
+	select {
+	case <-marker.diagnosed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected another diagnosis once the interval passed")
 	}
 }

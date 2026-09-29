@@ -9,7 +9,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 )
+
+// missDiagnoseInterval is the minimum gap between two diagnoses of a
+// connection the Marker couldn't mark. Each one dumps kernel tables.
+const missDiagnoseInterval = 30 * time.Second
 
 // Marker marks a live connection so downstream enforcement (e.g. tc/HTB)
 // can act on it. Handler passes dstIP straight through from Xray-core's
@@ -20,6 +26,15 @@ import (
 // invalid data callers need to filter out first.
 type Marker interface {
 	SetMark(proto string, srcIP net.IP, srcPort uint16, dstIP net.IP, dstPort uint16, mark uint32) error
+}
+
+// MissDiagnoser is optionally implemented by a Marker that can explain
+// why SetMark found nothing. DiagnoseMiss is expensive, so Handler calls
+// it at most once per missDiagnoseInterval, in the background, right
+// after a failure so the connection is most likely still alive. It
+// returns slog key/value pairs.
+type MissDiagnoser interface {
+	DiagnoseMiss(srcIP net.IP, srcPort, dstPort uint16) ([]any, error)
 }
 
 // RateSetter applies a bandwidth cap to a mark (e.g. by creating/updating
@@ -57,6 +72,10 @@ type Handler struct {
 	// provisionMu serializes rate.Set calls, so two webhooks for a new
 	// mark can't provision it twice.
 	provisionMu sync.Mutex
+
+	// lastDiagnose is when the last miss diagnosis started, in Unix
+	// nanoseconds.
+	lastDiagnose atomic.Int64
 }
 
 // New creates a webhook Handler. If rate is non-nil, every newly
@@ -145,6 +164,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.marker.SetMark("tcp", srcIP, srcPort, dstIP, dstPort, mark); err != nil {
 		h.log.Error("webhook: failed to set conntrack mark", "email", *ev.Email, "mark", mark, "error", err)
+		h.maybeDiagnose(*ev.Email, *ev.Source, srcIP, srcPort, dstPort)
 		http.Error(w, "failed to set conntrack mark", http.StatusInternalServerError)
 		return
 	}
@@ -155,6 +175,30 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Email string `json:"email"`
 		Mark  uint32 `json:"mark"`
 	}{Email: *ev.Email, Mark: mark})
+}
+
+// maybeDiagnose starts a background diagnosis of a failed mark if the
+// marker supports it and none has started in the last
+// missDiagnoseInterval.
+func (h *Handler) maybeDiagnose(email, source string, srcIP net.IP, srcPort, dstPort uint16) {
+	d, ok := h.marker.(MissDiagnoser)
+	if !ok {
+		return
+	}
+	now := time.Now().UnixNano()
+	last := h.lastDiagnose.Load()
+	if now-last < int64(missDiagnoseInterval) || !h.lastDiagnose.CompareAndSwap(last, now) {
+		return
+	}
+	go func() {
+		attrs, err := d.DiagnoseMiss(srcIP, srcPort, dstPort)
+		if err != nil {
+			h.log.Warn("webhook: diagnosing unmarked connection failed", "source", source, "error", err)
+			return
+		}
+		h.log.Warn("webhook: diagnosis of unmarked connection",
+			append([]any{"email", email, "source", source, "dst_port", dstPort}, attrs...)...)
+	}()
 }
 
 // parseHostPort parses xray-core's "ip:port" address fields. It also
