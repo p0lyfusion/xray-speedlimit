@@ -251,3 +251,27 @@ func TestLiveEnsureRootRebuildsOverOwnLayout(t *testing.T) {
 		t.Fatalf("class bytes = %v; want traffic in %#x", got, m)
 	}
 }
+
+// TestLiveEnsureRootAcceptsFallbackDefaultRate builds the layout at the
+// rate main falls back to when the interface reports no link speed
+// (fallbackDefaultClassRateMbit). It is 10x the rate the other live
+// tests use, and -htb-burst-ms turns it into a 125 MB burst, so it is
+// worth checking that tc takes it and that traffic still reaches a
+// per-user class under so large a default class.
+func TestLiveEnsureRootAcceptsFallbackDefaultRate(t *testing.T) {
+	peer4, _ := setupLiveVeth(t)
+
+	s := tcshape.New(liveIface, liveQueues, 100)
+	if err := s.EnsureRoot(false, 10_000); err != nil {
+		t.Fatalf("EnsureRoot at the fallback default rate: %v", err)
+	}
+
+	const m = 0x3002a
+	if err := s.SetRate(m, 1_000_000); err != nil {
+		t.Fatalf("SetRate: %v", err)
+	}
+	sendMarked(t, peer4, m, 10)
+	if got := classBytes(t, s); got[m] < 10*500 {
+		t.Fatalf("class bytes = %v; want traffic in %#x", got, m)
+	}
+}

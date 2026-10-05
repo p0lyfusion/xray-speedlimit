@@ -199,7 +199,7 @@ A mark with no class rides its queue's default class (`<q>:1`). So do unmarked t
 
 - Left at `0`, `-default-class-rate-mbit` is detected with `ethtool` on `-iface`.
 - Detection only happens when the layout is built. On a restart against an already-set-up interface, the existing classes keep their rates and `ethtool` isn't run.
-- Startup fails if `ethtool` can't report a speed, which is common on virtual interfaces (veth, tun/tap, wireguard). Pass the flag explicitly in that case.
+- Many interfaces report no speed to `ethtool` at all: virtio-net on a KVM VPS, veth, tun/tap, wireguard. Detection then falls back to 10000 Mbit/s with a warning rather than failing to start. The default class only has to be no lower than the real link capacity, and classes are flat siblings of it rather than children, so a rate above capacity costs nothing (the link stays the limit). To pin an exact value, pass the flag on the *first* start: by the bullet above, the rate is baked into the layout when it is built, so changing it later takes the flag plus a rebuild (`tc qdisc del dev <iface> root`), which drops every per-user class — re-provisioned by the next webhooks with `-per-user-rate-mbit`, re-`PUT` by hand otherwise.
 
 Without an explicit burst, HTB sizes a class's token bucket from its rate alone. That is usually a couple of KB, too small to absorb a page load or TCP slow start without extra throttling. `-htb-burst-ms` sets the bucket size as a duration instead: every class gets `rate * htb-burst-ms / 8000` bytes of burst, floored at 2 KB so `tc` never rejects it as too small.
 
@@ -330,7 +330,8 @@ The image includes `iproute2` (`tc`), `nftables` and `ethtool`, which the servic
       0 = every TX queue -iface has in use
 -default-class-rate-mbit uint
       rate (Mbit/s) for each queue's tc/HTB default class; 0 = auto-detect via
-      ethtool on -iface
+      ethtool on -iface, falling back to 10000 when it reports no speed, as
+      virtual NICs (including virtio-net on a VPS) don't
 -htb-burst-ms uint
       burst/cburst for every tc/HTB class, in milliseconds' worth of bytes at that
       class's own rate; 0 = kernel's default sizing (default 100)

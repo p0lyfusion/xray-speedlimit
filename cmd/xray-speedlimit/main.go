@@ -28,6 +28,18 @@ import (
 // (and a file descriptor) open indefinitely.
 const readHeaderTimeout = 10 * time.Second
 
+// fallbackDefaultClassRateMbit is the rate used for each queue's default
+// class when the link speed can't be detected and no rate was given.
+// Many interfaces report no speed at all: virtio-net on a VPS, veth,
+// tun/tap, wireguard. The default class is only a catch-all that must
+// not become a bottleneck, and every class is a flat sibling of it
+// rather than a child, so a rate above the real link capacity costs
+// nothing (the NIC stays the limit) while one below it would throttle
+// system traffic and every user's outbound leg. Overshooting is
+// therefore the safe way to be wrong, and refusing to start would
+// protect nothing.
+const fallbackDefaultClassRateMbit = 10_000
+
 // config holds everything main's flags configure.
 type config struct {
 	addr                 string
@@ -48,7 +60,7 @@ func main() {
 	flag.StringVar(&cfg.webhookAddr, "webhook-addr", "@xray-speedlimit-webhook", "listen address for the Xray webhook receiver, separate from -addr since this is hit on every new connection: host:port, a filesystem Unix socket path, or a Linux abstract socket (@name, or @@name padded for HAProxy compatibility) — abstract is the default and fastest, and needs no bind mount across a --network host container boundary")
 	flag.StringVar(&cfg.iface, "iface", "", "network interface for tc/HTB shaping (default: the interface used by the default route)")
 	flag.IntVar(&cfg.txQueues, "tx-queues", 0, "number of TX queues to spread users over, one HTB qdisc each (at most 255); 0 = every TX queue -iface has in use. Every user's mark depends on it")
-	flag.Uint64Var(&cfg.defaultClassRateMbit, "default-class-rate-mbit", 0, "rate (Mbit/s) for the tc/HTB default class, which catches all traffic with no per-user mark (system traffic, and every user's own outbound-to-destination leg); 0 = auto-detect via ethtool on -iface")
+	flag.Uint64Var(&cfg.defaultClassRateMbit, "default-class-rate-mbit", 0, "rate (Mbit/s) for the tc/HTB default class, which catches all traffic with no per-user mark (system traffic, and every user's own outbound-to-destination leg); 0 = auto-detect via ethtool on -iface, falling back to 10000 when it reports no speed, as virtual NICs (including virtio-net on a VPS) don't")
 	flag.Uint64Var(&cfg.htbBurstMs, "htb-burst-ms", 100, "burst/cburst allowance for every tc/HTB class (default and per-user), in milliseconds' worth of bytes at that class's own rate; 0 = kernel's own default sizing (normally just a couple KB)")
 	flag.Uint64Var(&cfg.perUserRateMbit, "per-user-rate-mbit", 0, "if set, automatically provisions this rate (Mbit/s) for every user's mark the first time it is seen, applying it uniformly to every user with zero manual provisioning; 0 = don't auto-provision, manage rates by hand via PUT /marks/{mark}")
 	flag.DurationVar(&cfg.remarkAfter, "remark-after", 10*time.Second, "don't mark a connection again when another webhook for it arrives within this long of the last successful mark; saves most of the work on multiplexing transports (XHTTP, mux), which send a webhook per sub-request. A connection that closes and is reopened from the same client port within this long stays unmarked until it passes. 0 = mark on every webhook")
@@ -202,11 +214,15 @@ func setupShaper(iface string, queues int, defaultClassRateMbit, htbBurstMs uint
 	// an existing one keeps whatever rate its default classes already have.
 	if !layoutExists {
 		if defaultClassRateMbit == 0 {
-			defaultClassRateMbit, err = netif.DetectLinkSpeedMbps(iface)
+			detected, err := netif.DetectLinkSpeedMbps(iface)
 			if err != nil {
-				return nil, fmt.Errorf("auto-detecting link speed on %s (pass -default-class-rate-mbit explicitly if this interface doesn't support ethtool speed reporting): %w", iface, err)
+				defaultClassRateMbit = fallbackDefaultClassRateMbit
+				log.Warn("could not detect this interface's link speed; using a fallback rate for the tc/HTB default classes, which only need to be no lower than the real link capacity. This rate becomes part of the layout, so raising it later takes -default-class-rate-mbit plus a rebuild (tc qdisc del dev <iface> root), which drops every per-user class",
+					"iface", iface, "mbit", defaultClassRateMbit, "err", err)
+			} else {
+				defaultClassRateMbit = detected
+				log.Info("auto-detected link speed for tc default classes", "iface", iface, "mbit", defaultClassRateMbit)
 			}
-			log.Info("auto-detected link speed for tc default classes", "iface", iface, "mbit", defaultClassRateMbit)
 		}
 		log.Warn("building the per-queue tc/HTB layout; this replaces the root qdisc and every class under it", "iface", iface, "tx_queues", queues)
 	}
